@@ -21,6 +21,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import NoSuchElementException
 
 # Click Functions
 def wait_span_click(driver: WebDriver, text: str, time: float=5.0, click: bool=True, scroll: bool=True, scrollTop: bool=False) -> WebElement | bool:
@@ -93,6 +94,38 @@ def boolean_button_click(driver: WebDriver, actions: ActionChains, text: str) ->
     except Exception as e:
         print_lg("Click Failed! Didn't find '"+text+"'")
         # print_lg(e)
+
+def click_button_text(driver: WebDriver, text: str) -> None:
+    """
+    Function to find and click a button by its text.
+    """
+    try:
+        button = driver.find_element(By.XPATH, f"//button[contains(., '{text}')]")
+        button.click()
+    except NoSuchElementException:
+        raise NoSuchElementException(f"Click Failed! Didn't find '{text}'")
+
+def wait_and_click_button_text(driver: WebDriver, text: str, timeout: int = 10) -> None:
+    """
+    Function to wait for a button to be clickable and then click it by its text.
+    """
+    try:
+        wait = WebDriverWait(driver, timeout)
+        button = wait.until(EC.element_to_be_clickable((By.XPATH, f"//button[contains(., '{text}')]")))
+        button.click()
+    except Exception:
+        raise NoSuchElementException(f"Click Failed! Didn't find '{text}'")
+
+def try_wait_and_click_button_text(driver: WebDriver, text: str, timeout: int = 3) -> bool:
+    """
+    Function to try to wait and click a button by its text.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        wait_and_click_button_text(driver, text, timeout)
+        return True
+    except Exception:
+        return False
 
 # Find functions
 def find_by_class(driver: WebDriver, class_name: str, time: float=5.0) -> WebElement | Exception:
