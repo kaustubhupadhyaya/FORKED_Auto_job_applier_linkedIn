@@ -1,0 +1,9 @@
+
+•	Reduced DAG parsing time by 30% through migrating 50+ production pipelines from Airflow1 to Airflow 2, utilizing Kubernetes pod orchestration and refactoring core Pyspark scripts.
+•	Achieved 99.5% uptime for the staging environment by engineering a secure platform with integrated AWS Secrets Manager and robust monitoring protocols.
+•	Streamlined data transformation pipeline integration via implementing DBT Cosmos to orchestrate dbt workflows, executing dbt models as native Airflow task.
+•	Decreased production incidents by 25% by building an automated Airflow monitoring framework featuring proactive error detection, scheduling, and alerting systems.
+API & Database Engineering	
+•	Systematized the delivery of pharmaceutical data by engineering 20+ XML-based REST APIs using a Dynamic Web Services framework, featuring complex multi-table SQL queries and JSON schema validation.
+•	Improved query speed by 35% by designing high-performance PostgreSQL schemas that utilized dimensional modeling, indexing, and partitioning.
+•	Minimized production downtime to under 2 hours by executing an Oracle to PostgreSQL migration that involved refactoring 55+ SQL queries and redesigning the core schema architecture.
