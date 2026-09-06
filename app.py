@@ -5,7 +5,8 @@ from datetime import datetime
 import os
 
 app = Flask(__name__)
-CORS(app)
+# Scope CORS to the local UI only (the page is served same-origin by Flask).
+CORS(app, resources={r"/*": {"origins": ["http://localhost:5000", "http://127.0.0.1:5000"]}})
 
 PATH = 'all excels/'
 ##> ------ Karthik Sarode : karthik.sarode23@gmail.com - UI for excel files ------
@@ -93,6 +94,9 @@ def update_applied_date(job_id):
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # debug=True exposes the Werkzeug interactive debugger (arbitrary code execution if reachable).
+    # Off by default; opt in locally with FLASK_DEBUG=1.
+    debug = os.environ.get('FLASK_DEBUG', '').lower() in ('1', 'true', 'yes')
+    app.run(debug=debug)
 
 ##<

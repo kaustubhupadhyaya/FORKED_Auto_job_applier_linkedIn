@@ -35,7 +35,7 @@ apiCheckInstructions = """
 2. If you're using an local LLM, please check if the server is running.
 3. Check if appropriate LLM and Embedding models are loaded and running.
 
-Open `secret.py` in `/config` folder to configure your AI API connections.
+Open `secrets.py` in `/config` folder to configure your AI API connections.
 
 ERROR:
 """
@@ -254,65 +254,3 @@ def ai_answer_question(
 ##<
 
 
-def ai_gen_experience(
-    client: OpenAI, 
-    job_description: str, about_company: str, 
-    required_skills: dict, user_experience: dict,
-    stream: bool = stream_output
-) -> dict | ValueError:
-    pass
-
-
-
-def ai_generate_resume(
-    client: OpenAI, 
-    job_description: str, about_company: str, required_skills: dict,
-    stream: bool = stream_output
-) -> dict | ValueError:
-    '''
-    Function to generate resume. Takes in user experience and template info from config.
-    '''
-    pass
-
-
-
-def ai_generate_coverletter(
-    client: OpenAI, 
-    job_description: str, about_company: str, required_skills: dict,
-    stream: bool = stream_output
-) -> dict | ValueError:
-    '''
-    Function to generate resume. Takes in user experience and template info from config.
-    '''
-    pass
-
-
-
-##< Evaluation Agents
-def ai_evaluate_resume(
-    client: OpenAI, 
-    job_description: str, about_company: str, required_skills: dict,
-    resume: str,
-    stream: bool = stream_output
-) -> dict | ValueError:
-    pass
-
-
-
-def ai_evaluate_resume(
-    client: OpenAI, 
-    job_description: str, about_company: str, required_skills: dict,
-    resume: str,
-    stream: bool = stream_output
-) -> dict | ValueError:
-    pass
-
-
-
-def ai_check_job_relevance(
-    client: OpenAI, 
-    job_description: str, about_company: str,
-    stream: bool = stream_output
-) -> dict:
-    pass
-#>

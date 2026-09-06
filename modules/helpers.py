@@ -121,9 +121,9 @@ def buffer(speed: int=0) -> None:
     '''
     if speed<=0:
         return
-    elif speed <= 1 and speed < 2:
+    elif speed < 2:
         return sleep(randint(6,10)*0.1)
-    elif speed <= 2 and speed < 3:
+    elif speed < 3:
         return sleep(randint(10,18)*0.1)
     else:
         return sleep(randint(18,round(speed)*10)*0.1)
@@ -196,23 +196,6 @@ def calculate_date_posted(time_string: str) -> datetime | None | ValueError:
     return None
 
 
-def convert_to_lakhs(value: str) -> str:
-    '''
-    Converts str value to lakhs, no validations are done except for length and stripping.
-    Examples:
-    * "100000" -> "1.00"
-    * "101,000" -> "10.1," Notice ',' is not removed 
-    * "50" -> "0.00"
-    * "5000" -> "0.05" 
-    '''
-    value = value.strip()
-    l = len(value)
-    if l > 0:
-        if l > 5:
-            value = value[:l-5] + "." + value[l-5:l-3]
-        else:
-            value = "0." + "0"*(5-l) + value[:2]
-    return value
 
 
 def convert_to_json(data) -> dict:

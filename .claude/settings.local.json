@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"C:\\\\Users\\\\Admin\\\\.claude\\\\settings.json\" 2>&1; ls \".claude\\\\settings.json\" 2>&1)",
+      "Read(//c/Users/Admin/.claude/**)",
+      "WebSearch"
+    ]
+  }
+}
