@@ -75,6 +75,55 @@ failed_count = 0
 skip_count = 0
 dailyEasyApplyLimitReached = False
 
+DAILY_LIMIT_MARKERS = (
+    "exceeded the daily application limit",
+    "limit daily submissions",
+    "save this job and apply tomorrow",
+    "we limit daily submissions to maintain quality and prevent bots",
+)
+
+
+def record_daily_limit_reached(reason: str = "") -> None:
+    global dailyEasyApplyLimitReached
+    dailyEasyApplyLimitReached = True
+    try:
+        marker_path = os.path.join(logs_folder_path, f"LINKEDIN_DAILY_LIMIT_{datetime.now():%Y-%m-%d}")
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        with open(marker_path, "w", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {reason}\n")
+    except Exception:
+        pass
+    print_lg("\n###############  Daily application limit for Easy Apply is reached!  ###############\n")
+
+
+def check_daily_limit_signal(driver_instance=None) -> tuple[bool, str]:
+    """Check if LinkedIn daily application limit banner is present on the page."""
+    d = driver_instance or driver
+    try:
+        elements = d.find_elements(By.CSS_SELECTOR, ".artdeco-inline-feedback__message, .artdeco-inline-feedback, [class*='inline-feedback']")
+        for el in elements:
+            txt = (el.text or "").lower().strip()
+            if any(m in txt for m in DAILY_LIMIT_MARKERS):
+                return True, txt
+        res = d.execute_script("""
+            const markers = [
+                'exceeded the daily application limit',
+                'limit daily submissions',
+                'save this job and apply tomorrow'
+            ];
+            const container = document.querySelector('.job-details-jobs-unified-top-card__container--two-pane, .jobs-unified-top-card, .jobs-details') || document.body;
+            const text = (container.innerText || '').toLowerCase();
+            for (const m of markers) {
+                if (text.includes(m)) return m;
+            }
+            return null;
+        """)
+        if res:
+            return True, str(res)
+    except Exception:
+        pass
+    return False, ""
+
 re_experience = re.compile(r'[(]?\s*(\d+)\s*[)]?\s*[-to]*\s*\d*[+]*\s*year[s]?', re.IGNORECASE)
 
 desired_salary_lakhs = str(round(desired_salary / 100000, 2))
@@ -114,12 +163,16 @@ def is_logged_in_LN() -> bool:
 def login_LN() -> None:
     '''
     Function to login for LinkedIn
-    * Tries to login using given `username` and `password` from `secrets.py`
+    * If the persistent profile already has a valid session, skips straight past
+      the login form and the credentials entirely
+    * Otherwise tries to login using given `username` and `password` from `secrets.py`
     * If failed, tries to login using saved LinkedIn profile button if available
     * If both failed, asks user to login manually
     '''
     # Find the username and password fields and fill them with user credentials
     driver.get("https://www.linkedin.com/login")
+    if is_logged_in_LN():
+        return print_lg("Already logged in via persistent session, skipping credential login!")
     try:
         wait.until(EC.presence_of_element_located((By.LINK_TEXT, "Forgot password?")))
         try:
@@ -747,7 +800,10 @@ def external_apply(pagination_element: WebElement, job_id: str, job_link: str, r
     global tabs_count, dailyEasyApplyLimitReached
     if easy_apply_only:
         try:
-            if "exceeded the daily application limit" in driver.find_element(By.CLASS_NAME, "artdeco-inline-feedback__message").text: dailyEasyApplyLimitReached = True
+            is_lim, matched_reason = check_daily_limit_signal(driver)
+            if is_lim:
+                record_daily_limit_reached(matched_reason)
+                if pagination_element != None: return True, application_link, tabs_count
         except: pass
         print_lg("Easy apply failed I guess!")
         if pagination_element != None: return True, application_link, tabs_count
@@ -989,6 +1045,12 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         ##<
 
                     uploaded = False
+                    # Check if daily limit banner is present on the page
+                    is_lim, matched_reason = check_daily_limit_signal(driver)
+                    if is_lim:
+                        record_daily_limit_reached(matched_reason)
+                        return
+
                     # Case 1: Easy Apply Button
                     if try_xp(driver, ".//button[contains(@class,'jobs-apply-button') and contains(@class, 'artdeco-button--3') and contains(@aria-label, 'Easy')]"):
                         try: 
@@ -1049,6 +1111,11 @@ def apply_to_jobs(search_terms: list[str]) -> None:
 
 
                         except Exception as e:
+                            # Check if failure was caused by daily application limit
+                            is_lim, matched_reason = check_daily_limit_signal(driver)
+                            if is_lim:
+                                record_daily_limit_reached(matched_reason)
+                                return
                             print_lg("Failed to Easy apply!")
                             # print_lg(e)
                             critical_error_log("Somewhere in Easy Apply process",e)

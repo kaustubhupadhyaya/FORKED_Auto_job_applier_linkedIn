@@ -71,6 +71,12 @@ run_in_background = False           # True or False, Note: True or False are cas
 # If you want to disable extensions then set disable_extensions as True (Better for performance)
 disable_extensions = False          # True or False, Note: True or False are case-sensitive
 
+# Use the isolated secure-vault Chrome profile (label "linkedin-1") instead of a guest
+# or your everyday Chrome profile. Persists your LinkedIn session across runs so most
+# runs skip the login form entirely, and keeps the bot out of your daily browser profile.
+# Takes priority over safe_mode below when True.
+use_vault_profile = True            # True or False, Note: True or False are case-sensitive
+
 # Run in safe mode. Set this true if chrome is taking too long to open or if you have multiple profiles in browser. This will open chrome in guest profile!
 safe_mode = True                   # True or False, Note: True or False are case-sensitive
 

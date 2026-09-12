@@ -13,8 +13,9 @@ version:    24.12.29.12.30
 '''
 
 from modules.helpers import make_directories
-from config.settings import run_in_background, stealth_mode, disable_extensions, safe_mode, file_name, failed_file_name, logs_folder_path, generated_resume_path
+from config.settings import run_in_background, stealth_mode, disable_extensions, safe_mode, use_vault_profile, file_name, failed_file_name, logs_folder_path, generated_resume_path
 from config.questions import default_resume_path
+import sys
 if stealth_mode:
     import undetected_chromedriver as uc
 else: 
@@ -34,7 +35,13 @@ try:
     if disable_extensions:  options.add_argument("--disable-extensions")
 
     print_lg("IF YOU HAVE MORE THAN 10 TABS OPENED, PLEASE CLOSE OR BOOKMARK THEM! Or it's highly likely that application will just open browser and not do anything!")
-    if safe_mode: 
+    if use_vault_profile:
+        sys.path.insert(0, r"C:\Users\Admin\.agents\skills\secure-vault")
+        import selenium_session
+        vault_profile_dir = selenium_session.profile_dir("linkedin-1")
+        options.add_argument(f"--user-data-dir={vault_profile_dir}")
+        print_lg(f"Using isolated secure-vault Chrome profile: {vault_profile_dir}")
+    elif safe_mode:
         print_lg("SAFE MODE: Will login with a guest profile, browsing history will not be saved in the browser!")
     else:
         profile_dir = find_default_profile_directory()
