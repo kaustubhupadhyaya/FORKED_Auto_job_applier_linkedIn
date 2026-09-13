@@ -15,10 +15,23 @@ version:    24.12.3.10.30
 
 ###################################################### CONFIGURE YOUR TOOLS HERE ######################################################
 
+# Credentials are sourced from the encrypted secure-vault, never stored here.
+# If the vault entries below are missing, run:
+#   python "C:\Users\Admin\.agents\skills\secure-vault\vault.py" gui --request "linkedin-1:account"
+#   python "C:\Users\Admin\.agents\skills\secure-vault\vault.py" gui --request "deepseek-llm-api:account"
+import sys as _sys
+_sys.path.insert(0, r"C:\Users\Admin\.agents\skills\secure-vault")
+import vault as _vault
 
 # Login Credentials for LinkedIn (Optional)
-username = "kaustubh.upadhyaya1@gmail.com"       # Enter your username in the quotes
-password = "9880380081@kK"           # Enter your password in the quotes
+username = _vault.get_secret("linkedin-1", "email")
+password = _vault.get_secret("linkedin-1", "password")
+if not username or not password:
+    raise RuntimeError(
+        'Vault entry "linkedin-1" is missing email/password.\n'
+        r'Run:  python "C:\Users\Admin\.agents\skills\secure-vault\vault.py" '
+        'gui --request "linkedin-1:account"  and fill it in, then re-run.'
+    )
 
 
 ## Artificial Intelligence (Beta Not-Recommended)
@@ -32,7 +45,7 @@ Note: Set it as True only if you want to use AI, and If you either have a
     c. LM Studio - https://lmstudio.ai/ (Recommended)
     d. Jan - https://jan.ai/
 2. OR you have a valid OpenAI API Key, and money to spare, and you don't mind spending it.
-CHECK THE OPENAI API PIRCES AT THEIR WEBSITE (https://openai.com/api/pricing/). 
+CHECK THE OPENAI API PIRCES AT THEIR WEBSITE (https://openai.com/api/pricing/).
 '''
 
 ##> ------ Yang Li : MARKYangL - Feature ------
@@ -44,44 +57,24 @@ Note: Select your AI provider.
 * "deepseek" - DeepSeek API (DeepSeek models)
 '''
 
-# DeepSeek Configuration
-deepseek_api_url = "https://api.deepseek.com"
-       # Examples: "https://api.deepseek.com", "https://api.deepseek.com/v1"
-'''
-Note: DeepSeek API URL. 
-This URL is compatible with OpenAI interface. The full endpoint will be {deepseek_api_url}/chat/completions.
-'''
-
-deepseek_api_key = "sk-68e091b71fb442b4a2da7d23a6857a2e"
-                # Enter your DeepSeek API key in the quotes
-'''
-Note: Enter your DeepSeek API key here. Leave it empty as "" or "not-needed" if not needed.
-'''
-deepseek_model = "deepseek-chat"
-llm_model = "deepseek-chat"  # Change from "gpt-3.5-turbo"
+# DeepSeek-compatible endpoint (non-secret)
+llm_model = "deepseek-chat"
     # Examples: "deepseek-chat", "deepseek-reasoner"
-'''
-Note: DeepSeek model selection
-* "deepseek-chat" - DeepSeek-V3, general conversation model
-* "deepseek-reasoner" - DeepSeek-R1, reasoning model
-'''
 ##<
 
-# Your Local LLM url or other AI api url and port
-llm_api_url = "https://api.openai.com/v1/"       # Examples: "https://api.openai.com/v1/", "http://127.0.0.1:1234/v1/", "http://localhost:1234/v1/"
+# Your Local LLM url or other AI api url and port (non-secret)
+llm_api_url = "https://api.deepseek.com"       # Examples: "https://api.deepseek.com", "http://127.0.0.1:1234/v1/", "http://localhost:1234/v1/"
 '''
 Note: Don't forget to add / at the end of your url
 '''
 
-# Your Local LLM API key or other AI API key 
-llm_api_key = "YOUR_OPENAI_API_KEY"              # Enter your API key in the quotes, make sure it's valid, if not will result in error.
+# Your Local LLM API key or other AI API key — sourced from the vault, never stored here.
+# Default to empty string if not configured in vault so validator passes when use_AI is False.
+llm_api_key = _vault.get_secret("deepseek-llm-api", "password") or ""
+r'''
+Note: If use_AI is True and this is empty, run:
+  python "C:\Users\Admin\.agents\skills\secure-vault\vault.py" gui --request "deepseek-llm-api:account"
 '''
-Note: Leave it empyt as "" or "not-needed" if not needed. Else will result in error!
-'''
-
-# Your local LLM model name or other AI model name
-       # Examples: "gpt-3.5-turbo", "gpt-4o", "llama-3.2-3b-instruct"
-
 
 #
 llm_spec = "openai"                # Examples: "openai", "openai-like", "openai-like-github", "openai-like-mistral"
