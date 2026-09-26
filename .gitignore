@@ -9,6 +9,7 @@ old
 
 secrets.py
 config/personals.py
+config/questions.py
 .venv
 apikeys.py
 linkedin_*.log
