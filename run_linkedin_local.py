@@ -88,12 +88,21 @@ try:
 
     _OrigChrome = _wd.Chrome
 
+    # 2026-09-30: with the external monitor off, maximize_window() left a 905x700 window on the
+    # 1366x768 laptop screen (viewport 889x549). LinkedIn's job list pane shrank to 289x447, cards
+    # just below its edge sat outside the scroll box, and every job-card click raised
+    # ElementClickInterceptedException (0 applications). A fixed large window does not depend on
+    # which monitor is active; Chrome allows a window larger than the screen.
+    _WINDOW = (0, 0, 1600, 1000)
+
     class _StableChrome(_OrigChrome):
         def __init__(self, *args, **kwargs):
             try:
                 _opts = kwargs.get("options")
                 if _opts is not None:
-                    for _flag in ("--disable-dev-shm-usage", "--disable-gpu"):
+                    for _flag in ("--disable-dev-shm-usage", "--disable-gpu",
+                                  f"--window-position={_WINDOW[0]},{_WINDOW[1]}",
+                                  f"--window-size={_WINDOW[2]},{_WINDOW[3]}"):
                         try:
                             _opts.add_argument(_flag)
                         except Exception:
@@ -101,6 +110,12 @@ try:
             except Exception:
                 pass
             super().__init__(*args, **kwargs)
+
+        def maximize_window(self):
+            try:
+                self.set_window_rect(x=_WINDOW[0], y=_WINDOW[1], width=_WINDOW[2], height=_WINDOW[3])
+            except Exception:
+                super().maximize_window()
 
     _wd.Chrome = _StableChrome
 except Exception as _e:
