@@ -21,17 +21,52 @@ LOG = os.path.join(REPO, "logs", "log.txt")
 PYTHON = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 MAX_RESTARTS = 6
 GATE_MARKER = os.path.join(REPO, "logs", "GATE_STOPPED")
+# 2026-09-30: written on every "needs a human" stop; linkedin_keepalive.ps1 does not relaunch
+# while today's marker exists (before this, a failed browser launch looped all night).
+NEEDS_HUMAN = os.path.join(REPO, "logs", "NEEDS_HUMAN")
+LAUNCH_FAILED_RC = 43   # run_linkedin_local.py: Chrome/driver could not start
 TRACKER_PATH = r"C:\Users\Admin\GitHub\job-tracker\track_job_applications.py"
+_tracker_proc = None
 
 
 def sync_tracker():
-    """Refresh the Excel tracker from both bots' records. Never blocks."""
+    """Refresh the Excel tracker in the background. 2026-09-30: this used to block the supervisor
+    (subprocess.run, 120 s timeout) before every launch, and the timeout killed the tracker,
+    possibly mid-save. Now: start it if none is running, never wait, never kill."""
+    global _tracker_proc
     try:
-        subprocess.run([PYTHON, TRACKER_PATH, "sync"], cwd=REPO, timeout=120,
-                       stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if _tracker_proc is not None and _tracker_proc.poll() is None:
+            return
+        _tracker_proc = subprocess.Popen([PYTHON, TRACKER_PATH, "sync"], cwd=REPO,
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL,
+                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as e:
-        slog(f"tracker sync failed: {e!r}")
+        slog(f"tracker sync could not start: {e!r}")
+
+
+def needs_human(reason):
+    slog(reason)
+    try:
+        with open(NEEDS_HUMAN, "w", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {reason}\n")
+    except Exception:
+        pass
+
+
+def _pid_alive(pid):
+    """os.kill(pid, 0) is NOT a liveness probe on Windows (signal 0 == CTRL_C_EVENT)."""
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    except Exception:
+        return False
 YIELD_WINDOW_MIN = 180       # rolling window for yield check
 YIELD_MIN_APPLIES = 1        # stop if fewer applies than this per window
 POLL_SEC = 600               # mid-run progress poll interval
@@ -101,9 +136,11 @@ try:
         try:
             with open(LOCK, encoding="utf-8") as fh:
                 old_pid = int(fh.read().strip())
-            os.kill(old_pid, 0)
-            print(f"supervisor already running (pid {old_pid}); exiting.", flush=True)
-            sys.exit(0)
+            if old_pid != os.getpid() and _pid_alive(old_pid):
+                print(f"supervisor already running (pid {old_pid}); exiting.", flush=True)
+                sys.exit(0)
+        except SystemExit:
+            raise
         except Exception:
             pass  # stale lock
     with open(LOCK, "w", encoding="utf-8") as fh:
@@ -121,10 +158,10 @@ while True:
     start = time.time()
     out = os.path.join(REPO, "logs", f"supervised-attempt-{attempt}.log")
     err = os.path.join(REPO, "logs", f"supervised-attempt-{attempt}.err.log")
+    # (2026-09-30: no PATH prepend any more - a stale chromedriver there pinned the driver
+    # version; Selenium Manager now picks the one matching the installed Chrome.)
     env = dict(os.environ)
-    env["PATH"] = r"C:\WebDrivers;" + env.get("PATH", "")
     slog(f"attempt {attempt}: launching bot (saved={before}).")
-    sync_tracker()
     attempt_start_ts = time.time()
     try:
         with open(out, "ab") as fo, open(err, "ab") as fe:
@@ -193,19 +230,23 @@ while True:
     if os.path.exists(today_marker) or rc == 44:
         slog("daily Easy Apply limit reached — goal achieved, stopping supervisor.")
         break
+    if rc == LAUNCH_FAILED_RC:
+        needs_human("browser/driver launch failed (rc 43) — NOT restarting; see logs/log.txt and "
+                    "logs/supervised-attempt-*.err.log.")
+        break
     if rc == 42:
-        slog("apply gate stop (modal missing) — cooling off, needs human review. NOT restarting.")
+        needs_human("apply gate stop (modal missing) — cooling off, needs human review. NOT restarting.")
         break
     if gained == -2:
-        slog("killed for zero yield — needs human review. NOT restarting.")
+        needs_human("killed for zero yield — needs human review. NOT restarting.")
         break
     if restarts >= MAX_RESTARTS:
-        slog("max restarts used — stopping (needs human review).")
+        needs_human("max restarts used — stopping (needs human review).")
         break
     if gained == 0 and mins < 10:
         zero_apply_streak += 1
         if zero_apply_streak >= 2:
-            slog("two consecutive zero-apply short runs — persistent breakage, stopping.")
+            needs_human("two consecutive zero-apply short runs — persistent breakage, stopping.")
             break
     elif gained and gained > 0:
         zero_apply_streak = 0

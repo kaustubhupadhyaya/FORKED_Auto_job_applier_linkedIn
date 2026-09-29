@@ -25,12 +25,11 @@ from datetime import datetime
 REPO = os.path.dirname(os.path.abspath(__file__))
 os.chdir(REPO)
 
-# Stable chromedriver first (scratchpad Temp path is fragile). Harmless if absent.
-for _p in (r"C:\WebDrivers",
-           r"C:\Users\Admin\AppData\Local\Temp\claude\c--Users-Admin-GitHub"
-           r"\bb5023c5-610e-4f50-b6c0-d26ceafe0259\scratchpad\bin"):
-    if os.path.isdir(_p) and _p not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = _p + os.sep + ";" + os.environ.get("PATH", "")
+# 2026-09-30: removed a PATH prepend of C:\WebDrivers and an old Temp scratchpad\bin that held
+# chromedriver 152. Selenium Manager uses a driver found on PATH even when its version does not
+# match, so after Chrome auto-updated to 154 every launch failed ("only supports Chrome version
+# 152") and the supervisor looped all night. With nothing prepended, Selenium Manager fetches
+# the chromedriver that matches the installed Chrome.
 
 # Console must never raise on ₹/emoji (that used to masquerade as "log.txt occupied").
 try:
@@ -111,7 +110,15 @@ except Exception as _e:
         pass
 
 # --- Import the bot (launches Chrome on import via modules.open_chrome) --------
-import runAiBot as R  # noqa: E402
+# 2026-09-30: open_chrome.py calls exit() (code 0) when Chrome/driver cannot start, which made a
+# dead launch look like a clean run. Turn that into exit 43 so the supervisor stops and flags it.
+try:
+    import runAiBot as R  # noqa: E402
+except SystemExit as _launch_exit:
+    if _launch_exit.code in (None, 0):
+        _note("browser/driver launch failed while importing runAiBot (exit 0) -> exit 43")
+        sys.exit(43)
+    raise
 import modules.helpers as _helpers  # noqa: E402
 import modules.clickers_and_finders as _clickers  # noqa: E402
 from selenium.webdriver.common.by import By  # noqa: E402

@@ -268,7 +268,7 @@ function Start-SupervisorDetached {
     }
 
     $env:PYTHONUNBUFFERED = "1"
-    $env:PATH = "C:\WebDrivers;" + $env:PATH
+    # (2026-09-30: no C:\WebDrivers PATH prepend - a stale chromedriver on PATH pins the version.)
 
     $proc = Start-Process -FilePath $PythonExe `
         -ArgumentList $ScriptFile `
@@ -377,6 +377,41 @@ function Invoke-KeepalivePass {
     }
     $state | Add-Member -NotePropertyName "MissedChecks" -NotePropertyValue 0 -Force
     Save-KeepaliveState $state
+
+    # 6b. 2026-09-30: the supervisor writes logs\NEEDS_HUMAN when it stops for a reason a relaunch
+    # cannot fix (browser/driver launch failed rc 43, apply gate rc 42, zero yield, persistent
+    # breakage, max restarts). Before this, the keepalive relaunched it every 2-4 min all night.
+    # Today's marker blocks relaunching; a marker from an earlier day is set aside so the new day
+    # gets one fresh attempt (a persistent break re-writes it within minutes).
+    $needsHuman = Join-Path $LogsDir "NEEDS_HUMAN"
+    $block = $null
+    if (Test-Path $needsHuman) {
+        $nh = Get-Item $needsHuman -ErrorAction SilentlyContinue
+        if ($nh -and $nh.LastWriteTime.ToString("yyyy-MM-dd") -eq $todayStr) {
+            $block = "NEEDS_HUMAN: " + (Get-Content $needsHuman -TotalCount 1 -ErrorAction SilentlyContinue)
+        } elseif ($nh) {
+            $prev = "$needsHuman.$($nh.LastWriteTime.ToString('yyyy-MM-dd')).prev"
+            Move-Item $needsHuman $prev -Force -ErrorAction SilentlyContinue
+            Write-KeepaliveLog "NEEDS_HUMAN from $($nh.LastWriteTime.ToString('yyyy-MM-dd')) set aside ($prev); giving the new day one fresh attempt." "WARN"
+        }
+    }
+    if (-not $block -and (Test-Path $GateMarkerPath) -and $state.LastLaunchTime) {
+        try {
+            if ((Get-Item $GateMarkerPath).LastWriteTime -gt [datetime]$state.LastLaunchTime) {
+                $block = "GATE_STOPPED written after the last launch"
+            }
+        } catch {}
+    }
+    if ($block) {
+        $lastNote = $null
+        try { $lastNote = [datetime]$state.LastBlockedLog } catch {}
+        if (-not $lastNote -or ($now - $lastNote).TotalMinutes -ge 30) {
+            Write-KeepaliveLog "Not relaunching: $block. Fix the cause, then delete $needsHuman (and GATE_STOPPED if present)." "ERROR"
+            $state | Add-Member -NotePropertyName "LastBlockedLog" -NotePropertyValue $now.ToString("o") -Force
+            Save-KeepaliveState $state
+        }
+        return
+    }
 
     # 7. Exponential crash backoff
     if ($state.LastLaunchTime) {
