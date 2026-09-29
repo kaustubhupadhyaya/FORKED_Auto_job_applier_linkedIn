@@ -59,17 +59,19 @@ def _note(msg):
 
 
 def _no_alert(*args, **kwargs):
-    _note(f"alert suppressed title={kwargs.get('title', args[1] if len(args) > 1 else '')!r} "
-          f"text={str(args[0])[:160]!r}")
+    text = kwargs.get("text", args[0] if len(args) > 0 else "")
+    title = kwargs.get("title", args[1] if len(args) > 1 else "")
+    _note(f"alert suppressed title={title!r} text={str(text)[:160]!r}")
     return kwargs.get("button", "OK")
 
 
 def _no_confirm(*args, **kwargs):
+    text = kwargs.get("text", args[0] if len(args) > 0 else "")
+    title = kwargs.get("title", args[1] if len(args) > 1 else "")
     buttons = kwargs.get("buttons")
     if buttons is None and len(args) >= 3:
         buttons = args[2]
-    _note(f"confirm suppressed title={kwargs.get('title', args[1] if len(args) > 1 else '')!r} "
-          f"text={str(args[0])[:160]!r} buttons={buttons!r}")
+    _note(f"confirm suppressed title={title!r} text={str(text)[:160]!r} buttons={buttons!r}")
     if isinstance(buttons, (list, tuple)) and buttons:
         return buttons[0]
     return "OK"

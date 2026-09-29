@@ -190,7 +190,7 @@ while True:
          f"saved+{gained} run_stats(applied={applied}, failed={failed}).")
 
     today_marker = os.path.join(REPO, "logs", f"LINKEDIN_DAILY_LIMIT_{datetime.now():%Y-%m-%d}")
-    if os.path.exists(today_marker) or rc == 44 or log_tail_has("Daily application limit"):
+    if os.path.exists(today_marker) or rc == 44:
         slog("daily Easy Apply limit reached — goal achieved, stopping supervisor.")
         break
     if rc == 42:

@@ -195,14 +195,10 @@ except Exception as e:
 function Test-DailyLimitReached {
     param(
         $State,
-        [string]$TodayStr
+        [string]$TodayStr,
+        [int]$TodayCount = -1
     )
-    # 1. State flag already verified for today
-    if ($State.LastLimitDate -and $State.LastLimitDate -eq $TodayStr) {
-        return $true
-    }
-
-    # 2. Check for today's machine-readable daily limit marker file
+    # 1. Check for today's machine-readable daily limit marker file (written ONLY on genuine limit banner)
     $markerPath = Join-Path $LogsDir "LINKEDIN_DAILY_LIMIT_$TodayStr"
     if (Test-Path $markerPath) {
         $State | Add-Member -NotePropertyName "LastLimitDate" -NotePropertyValue $TodayStr -Force
@@ -210,33 +206,15 @@ function Test-DailyLimitReached {
         return $true
     }
 
-    # 3. Check supervisor.log for today's limit signal
-    if (Test-Path $SupervisorLogPath) {
-        $supLines = Get-FileTailShared -Path $SupervisorLogPath -MaxLines 200
-        foreach ($line in $supLines) {
-            if ($line.StartsWith($TodayStr) -and ($line -like "*daily Easy Apply limit reached*" -or $line -like "*Daily application limit*")) {
-                $State | Add-Member -NotePropertyName "LastLimitDate" -NotePropertyValue $TodayStr -Force
-                Save-KeepaliveState $State
-                return $true
-            }
-        }
-    }
-
-    # 4. Check log.txt if modified today
-    if (Test-Path $BotLogPath) {
-        $logItem = Get-Item $BotLogPath -ErrorAction SilentlyContinue
-        if ($logItem -and $logItem.LastWriteTime.ToString("yyyy-MM-dd") -eq $TodayStr) {
-            $botLines = Get-FileTailShared -Path $BotLogPath -MaxLines 300
-            foreach ($line in $botLines) {
-                if ($line -like "*Daily application limit for Easy Apply is reached!*" -or `
-                    $line -like "*exceeded the daily application limit*" -or `
-                    $line -like "*limit daily submissions*" -or `
-                    $line -like "*apply tomorrow*") {
-                    $State | Add-Member -NotePropertyName "LastLimitDate" -NotePropertyValue $TodayStr -Force
-                    Save-KeepaliveState $State
-                    return $true
-                }
-            }
+    # 2. State flag verified for today ONLY if marker exists or today's count > 0
+    if ($State.LastLimitDate -and $State.LastLimitDate -eq $TodayStr) {
+        if ($TodayCount -gt 0 -or (Test-Path $markerPath)) {
+            return $true
+        } else {
+            # Guard: 0 applications applied today and no marker file exists.
+            # Clear suspicious limit flag to ensure self-healing relaunch instead of false rest.
+            $State.LastLimitDate = $null
+            Save-KeepaliveState $State
         }
     }
 
@@ -320,9 +298,9 @@ function Invoke-KeepalivePass {
     $isRunning = ($runningProcs -ne $null -and @($runningProcs).Count -gt 0)
     $activeProc = if ($isRunning) { @($runningProcs)[0] } else { $null }
 
-    # 2. Check daily limit flag and applied count
-    $limitReached = Test-DailyLimitReached -State $state -TodayStr $todayStr
+    # 2. Check applied count & daily limit flag
     $todayCount   = Get-DailyAppliedCount -CsvPath $HistoryCsvPath -PyExe $PythonExe
+    $limitReached = Test-DailyLimitReached -State $state -TodayStr $todayStr -TodayCount $todayCount
 
     # 3. Status display mode
     if ($Status) {
@@ -440,6 +418,19 @@ function Invoke-KeepalivePass {
 # ---------------------------------------------------------------- Execution
 if ($Status) {
     Invoke-KeepalivePass
+    exit 0
+}
+
+# Prevent duplicate supervisor instances
+$myPid = $PID
+$otherSupervisors = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' or Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.ProcessId -ne $myPid -and
+        $_.CommandLine -like "*linkedin_keepalive.ps1*" -and
+        $_.CommandLine -notlike "*-Status*"
+    })
+if ($otherSupervisors.Count -gt 0) {
+    Write-KeepaliveLog "Another LinkedIn keepalive supervisor is already active (PID $($otherSupervisors[0].ProcessId)). Exiting this instance to prevent duplicates." "INFO"
     exit 0
 }
 
