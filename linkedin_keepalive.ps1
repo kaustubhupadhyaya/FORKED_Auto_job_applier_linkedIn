@@ -66,6 +66,7 @@ $SupervisorLogPath = Join-Path $LogsDir "supervisor.log"
 $GateMarkerPath    = Join-Path $LogsDir "GATE_STOPPED"
 $SupervisorLock    = Join-Path $LogsDir "supervisor.lock"
 $HistoryCsvPath    = Join-Path $RepoDir "all excels\all_applied_applications_history.csv"
+$LimitRetryHours   = 2     # a limit carried over from yesterday (0 saved today) is retried this often
 
 # ---------------------------------------------------------------- Logging
 function Write-KeepaliveLog {
@@ -342,6 +343,36 @@ function Invoke-KeepalivePass {
 
     # 5. Process is DEAD - Check Daily Limit Flag
     # If today's daily limit has been reached, sleep peacefully until tomorrow (or exit on SinglePass)
+    if ($limitReached -and $todayCount -eq 0 -and -not $SinglePass) {
+        # LinkedIn's Easy Apply limit is not a local calendar day: after a big day (68 on 2026-09-30
+        # until 07:27) it refused again at 00:05 with nothing saved today, and resting until tomorrow
+        # lost the whole day (also on 2026-09-19). The limit is carried over, so retry every
+        # $LimitRetryHours h: set today's marker aside and relaunch; the bot writes a new marker if
+        # LinkedIn still refuses. (User's choice, 2026-10-01.)
+        $retryAt = $now.AddHours($LimitRetryHours)
+        $tomorrow = $now.Date.AddDays(1).AddMinutes(1)
+        if ($retryAt -lt $tomorrow) {
+            Write-KeepaliveLog "LinkedIn's limit came with nothing saved today (carried over from yesterday). Retrying at $($retryAt.ToString('HH:mm')) instead of resting until tomorrow." "WARN"
+            $state | Add-Member -NotePropertyName "LimitRetryAt" -NotePropertyValue $retryAt.ToString("s") -Force
+            $state.ConsecutiveCrashes = 0
+            Save-KeepaliveState $state
+            while ((Get-Date) -lt $retryAt) {
+                $chunk = [Math]::Min(300, [int]($retryAt - (Get-Date)).TotalSeconds)
+                if ($chunk -le 0) { break }
+                Start-Sleep -Seconds $chunk
+            }
+            $marker = Join-Path $LogsDir "LINKEDIN_DAILY_LIMIT_$todayStr"
+            if (Test-Path $marker) {
+                Move-Item -Path $marker -Destination "$marker.carryover-$((Get-Date).ToString('HHmm'))" -Force -ErrorAction SilentlyContinue
+            }
+            $state = Get-KeepaliveState
+            $state.LastLimitDate = $null
+            $state | Add-Member -NotePropertyName "LimitRetryAt" -NotePropertyValue $null -Force
+            Save-KeepaliveState $state
+            Write-KeepaliveLog "Retry time reached; set today's carried-over limit marker aside. Relaunching on the next pass." "INFO"
+            return
+        }
+    }
     if ($limitReached) {
         Write-KeepaliveLog "Daily application limit reached for today ($todayStr). LinkedIn auto-apply has completed its daily run ($todayCount applied). Resting until tomorrow." "OK"
         $state.LastLimitDate = $todayStr
