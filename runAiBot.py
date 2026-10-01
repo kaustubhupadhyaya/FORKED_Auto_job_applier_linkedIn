@@ -478,6 +478,9 @@ def answer_common_questions(label: str, answer: str) -> str:
     # 1 year of experience?" with Yes (seen 2026-10-01). Experience is years_of_experience, never fresher.
     elif 'fresher' in label or re.search(r'(no more than|less than|under|at most)\s+(1|one)\s+year', label):
         answer = 'Yes' if int(years_of_experience or 0) < 1 else 'No'
+    # "Are you serving your notice period?" also fell to the Yes default; the user is not (2026-09-24).
+    elif 'serving' in label and 'notice' in label:
+        answer = 'No'
     return answer
 
 
