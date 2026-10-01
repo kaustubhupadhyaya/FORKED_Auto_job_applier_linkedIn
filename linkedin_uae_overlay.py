@@ -99,15 +99,24 @@ def _load(path: Path, name: str):
 
 
 def _applied_today() -> int:
-    """Live applications today, counted from the per-job rows (written the moment a job is submitted, so a crash cannot lose them).
-    A submission that LinkedIn did not show as applied (a verify_failed row and no verified row after it) does not use up the quota."""
+    """Live Submit clicks today, counted from the per-job rows (written the moment a job is submitted, so a crash cannot lose them).
+    The quota is a ceiling on submissions: every click is charged, verified or not, so a check that fails (or LinkedIn being slow to show
+    a real application) can never let the pass apply beyond the cap. Whether a submission COUNTS as an application (towards earning the
+    dashboard back) is a separate question, answered only by `verified` rows."""
+    today = date.today().isoformat()
+    return len({str(r.get("job_id")) for r in _read_jsonl(JOBS_LOG)
+                if r.get("outcome") == "applied" and r.get("mode") == "live" and str(r.get("ts", ""))[:10] == today})
+
+
+def _unverified_today() -> int:
+    """Live submissions today that LinkedIn did not show as applied and that no later check verified. Read from the log (not from pass
+    state), so the breaker spans passes and restarts."""
     today = date.today().isoformat()
     rows = _read_jsonl(JOBS_LOG)
-    applied = {str(r.get("job_id")) for r in rows
-               if r.get("outcome") == "applied" and r.get("mode") == "live" and str(r.get("ts", ""))[:10] == today}
-    failed = {str(r.get("job_id")) for r in rows if r.get("outcome") == "verify_failed" and r.get("mode") == "live"}
+    failed = {str(r.get("job_id")) for r in rows
+              if r.get("outcome") == "verify_failed" and r.get("mode") == "live" and str(r.get("applied_ts", ""))[:10] == today}
     verified = {str(r.get("job_id")) for r in rows if r.get("outcome") == "verified" and r.get("mode") == "live"}
-    return len(applied - (failed - verified))
+    return len(failed - verified)
 
 
 # ------------------------------------------------------------------ per-pass state
@@ -127,6 +136,7 @@ class Pass:
         self.seen: set = set()                      # job ids already opened in this pass (a job can come up under several search terms)
         self.unverified = 0                         # live submissions this pass that LinkedIn did not show as applied
         self.ai = None                              # the AI answerer module, loaded by _uae_pass only when the arming file asks for it
+        self.ai_memo: dict = {}                     # (job, question, kind, options) -> what the AI answerer said: the bot re-asks a page that does not advance
 
     def _handled_ids(self) -> set:
         """Jobs not worth opening again: applied, or skipped under the same facts file and resolver. A job inventoried as answerable
@@ -277,7 +287,8 @@ def _post_submit_evidence() -> None:
 def _verify_after_submit(job: dict, applied_ts: str) -> None:
     """Right after a live Submit: look for LinkedIn's own Applied state (up to 15 s: the card and pane update a moment after the modal closes)
     and write a `verified` or `verify_failed` row joined to the applied row by job id. Only `verified` rows count towards earning the
-    dashboard back; a failed one gives its quota slot back, and two in one pass switch the live pass off until a human has looked. Never raises."""
+    dashboard back; the quota is charged either way (it caps submissions), and two unverified submissions in a day switch the live pass
+    off until a human has looked. Never raises."""
     how, err = "", ""
     try:
         for _ in range(5):
@@ -296,19 +307,19 @@ def _verify_after_submit(job: dict, applied_ts: str) -> None:
         return
     S.counts["verify_failed"] += 1
     S.unverified += 1
-    S.quota_left += 1
     S.screenshot("not-verified")
     _dump_dom(job["job_id"])
     _jsonl(JOBS_LOG, base | {"outcome": "verify_failed", "reason": err or "no Applied marker on the job card or pane within 15 s"})
-    _note(f"uae: NOT verified on LinkedIn: {job['title']} | {job['company']} ({S.unverified} this pass)")
-    if S.unverified >= 2:
+    today_n = _unverified_today()                   # counted from the log: it spans passes and restarts, not just this pass
+    _note(f"uae: NOT verified on LinkedIn: {job['title']} | {job['company']} ({today_n} today)")
+    if today_n >= 2:
         _R.switch_number = 0
         try:
-            VERIFY_STOP.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} two live submissions in one pass were not shown as applied by LinkedIn; "
+            VERIFY_STOP.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} two live submissions today were not shown as applied by LinkedIn; "
                                    "the live UAE pass stays off until you have looked (delete this file to resume).\n", encoding="utf-8")
         except OSError:
             pass
-        _note("uae: two submissions in one pass could not be verified; live pass stopped and switched off (see LINKEDIN_UAE_VERIFY_STOPPED)")
+        _note("uae: two submissions today could not be verified; live pass stopped and switched off (see LINKEDIN_UAE_VERIFY_STOPPED)")
 
 
 # ------------------------------------------------------------------ reading and filling the Easy Apply questions
@@ -490,21 +501,39 @@ def _fill_inner(q: dict, ans, F) -> str:
     _fail(q, f"cannot fill a {kind} question", F)
 
 
+AI_KINDS = ("select", "radio", "text")                  # what _fill_inner can fill: there is no textarea branch, so no AI call for one
+AI_TRANSIENT_STAGES = ("transport", "breaker", "material")
+
+
 def _ai_rescue(q: dict, exc):
     """(answer, exception). Only a REQUIRED question that no intent maps at all can reach the AI answerer (which re-checks that itself);
     every other refusal (unconfirmed fact, visa, ID, relocation, compound, skill not on the resume...) stays a refusal, and so does every
     decline or failure of the answerer. A used AI answer is logged in full to ai_answers.jsonl and marks the job."""
-    if S.ai is None or not q["required"] or exc.reason != "no intent maps this question":
+    if S.ai is None or not q["required"] or q["kind"] not in AI_KINDS or exc.reason != "no intent maps this question":
         return None, exc
+    key = (S.job["job_id"], q["label"], q["kind"], tuple(q["options"]))
+    if key in S.ai_memo:                                    # the bot re-asks a page that did not advance: one model call per question
+        ans, why_not = S.ai_memo[key]
+        if ans is not None:
+            S.job["ai_answered"] = True
+        return (ans, exc) if ans is not None else (None, why_not)
+    row = {"ts": datetime.now().isoformat(timespec="seconds"), "mode": S.mode, "job_id": S.job["job_id"], "title": S.job["title"],
+           "company": S.job["company"], "question": q["label"], "kind": q["kind"], "options": q["options"][:12], "facts_rev": S.facts.rev}
     try:
         ans = S.ai.ai_answer(S.facts, q["label"], q["kind"], q["options"], numeric=q["numeric"], required=q["required"], ctx=S.ctx())
     except Exception as x:
+        audit = getattr(x, "audit", None) or {}
         why = getattr(x, "reason", None) or f"{type(x).__name__}: {str(x)[:80]}"
-        return None, S.F.Unanswerable(f"{exc.reason}; the AI answerer declined: {why}"[:220], intent=exc.intent, facts=exc.facts)
+        # an outage (transport, circuit breaker) or a missing resume file is not a property of the question: the job ends "failed" and is
+        # looked at again, instead of being skipped for good under this revision
+        transient = not hasattr(x, "reason") or audit.get("stage") in AI_TRANSIENT_STAGES
+        _jsonl(AI_LOG, row | {"answer": None, "declined": why, "stage": audit.get("stage"), "audit": audit})
+        refusal = S.F.Unanswerable(f"{exc.reason}; the AI answerer declined: {why}"[:220], intent="fill" if transient else exc.intent, facts=exc.facts)
+        S.ai_memo[key] = (None, refusal)
+        return None, refusal
     S.job["ai_answered"] = True
-    _jsonl(AI_LOG, {"ts": datetime.now().isoformat(timespec="seconds"), "mode": S.mode, "job_id": S.job["job_id"], "title": S.job["title"],
-                    "company": S.job["company"], "question": q["label"], "kind": q["kind"], "options": q["options"][:12],
-                    "answer": ans.value, "audit": getattr(ans, "audit", {}), "facts_rev": S.facts.rev})
+    _jsonl(AI_LOG, row | {"answer": ans.value, "audit": getattr(ans, "audit", {})})
+    S.ai_memo[key] = (ans, None)
     return ans, exc
 
 
@@ -514,7 +543,7 @@ def _load_ai(F, facts, arm: dict):
     under another answerer (or none), or held back until the AI answers were approved, are looked at again."""
     try:
         mod = _load(FACTS_PKG / "ai_answer.py", "uae_ai_answer")
-        facts.rev = f"{facts.rev}-ai{mod.answerer_fingerprint()}{'L' if arm.get('ai_live') else 'I'}"
+        facts.rev = f"{facts.rev}-ai{mod.answerer_fingerprint()}{'L' if arm.get('ai_live') is True else 'I'}"
         return mod
     except Exception as e:
         _note(f"uae: AI answerer not loaded ({type(e).__name__}: {str(e)[:100]}); no AI this pass")
@@ -681,7 +710,7 @@ def _patches(R) -> dict:
                 R.print_lg(f"UAE pass: Submit refused, job is blocked ({blocked[:90]}).")
                 return False
             # AI-written selections are never submitted until the user has read the first ones and set "ai_live" in the arming file
-            hold_ai = S.mode == "live" and bool(S.job.get("ai_answered")) and not S.arm.get("ai_live")
+            hold_ai = S.mode == "live" and bool(S.job.get("ai_answered")) and S.arm.get("ai_live") is not True
             if S.mode == "inventory" or S.job.get("uses_proposed") or hold_ai:
                 # would_apply only when a Submit button is really there: the bot's finally asks for Submit after a stuck loop, a
                 # timeout or an unread page too, and those jobs are not "answered completely"
@@ -744,6 +773,17 @@ def _patches(R) -> dict:
                 S.screenshot("blocked")
             outcome = (("failed" if S.job.get("block_transient") else "skipped_unanswerable") if blocked
                        else "skipped_job" if "Skipped" in str(application_link) else "failed")
+            if outcome == "failed" and not blocked and S.mode == "live" and not S.job.get("done"):
+                # the bot's flow raised, but a Submit click that was already dispatched may have gone through (a renderer timeout, a stale
+                # element after the modal closed): when LinkedIn itself already shows this job as applied, record what happened
+                late = _applied_marker(str(job_id))
+                if late:
+                    S.finish("applied", f"the bot's flow raised after Submit ({error}) but LinkedIn shows the job as applied")
+                    _jsonl(JOBS_LOG, {"ts": datetime.now().isoformat(timespec="seconds"), "mode": "live", "facts_rev": S.facts.rev,
+                                      "job_id": str(job_id), "title": S.job["title"], "company": S.job["company"],
+                                      "applied_ts": S.job["ts"], "outcome": "verified", "how": late + " (found after the flow raised)"})
+                    S.counts["verified"] += 1
+                    return
             S.finish(outcome, blocked or f"{error}: {str(exception)[:140]}")
 
     def external(pagination_element, job_id, job_link, resume, date_listed, application_link, screenshot_name):

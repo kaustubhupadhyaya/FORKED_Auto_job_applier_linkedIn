@@ -174,6 +174,24 @@ def wait_for_ram():
     slog(f"free RAM still {free} MB after {RAM_WAIT_MAX_MIN} min - launching anyway (bounded wait).")
 
 
+def sweep_stale_browsers():
+    """Close Chrome processes still holding the bot's profile (linkedin-1): a crashed or half-started run leaves them behind, and a new Chrome
+    on the same profile then fails with "DevToolsActivePort file doesn't exist". The keepalive does the same before it starts a supervisor.
+    Only called when our own child has already exited. Never raises."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object { $_.CommandLine -like '*linkedin-1*' } | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }")
+    try:
+        import base64
+        enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc], capture_output=True, text=True,
+                           timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        n = len([ln for ln in r.stdout.splitlines() if ln.strip().isdigit()])
+        if n:
+            slog(f"closed {n} stale Chrome process(es) holding the bot profile.")
+    except Exception as e:
+        slog(f"stale-browser sweep failed: {e!r}")
+
+
 # Single-instance guard
 try:
     os.makedirs(os.path.dirname(LOCK), exist_ok=True)
@@ -210,6 +228,7 @@ while True:
     env = dict(os.environ)
     slog(f"attempt {attempt}: launching bot (saved={before}).")
     attempt_start_ts = time.time()
+    killed_zero_yield = False   # a flag, not a value of `gained`: that variable is recomputed from the log after the run (the old -2 sentinel was lost)
     try:
         with open(out, "ab") as fo, open(err, "ab") as fe:
             proc = subprocess.Popen([PYTHON, "run_linkedin_local.py"], cwd=REPO,
@@ -259,7 +278,7 @@ while True:
                     except Exception:
                         pass
                 rc = proc.returncode
-                gained = -2  # sentinel: killed for zero yield → do not restart
+                killed_zero_yield = True  # needs a human, do not restart (see the check after the run)
                 break
     except Exception as e:
         slog(f"attempt {attempt}: launch failed ({e!r}); cooldown 120s.")
@@ -282,6 +301,7 @@ while True:
         if launch_fails <= LAUNCH_RETRIES:
             slog(f"browser/driver launch failed (rc 43), retry {launch_fails}/{LAUNCH_RETRIES} in "
                  f"{LAUNCH_RETRY_WAIT_SEC // 60} min (free RAM {free_ram_mb()} MB).")
+            sweep_stale_browsers()      # a half-started Chrome still holding the profile makes the next start fail the same way
             time.sleep(LAUNCH_RETRY_WAIT_SEC)
             continue
         needs_human(f"browser/driver launch failed (rc 43) {launch_fails} times in a row — NOT restarting; "
@@ -291,7 +311,7 @@ while True:
     if rc == 42:
         needs_human("apply gate stop (modal missing) — cooling off, needs human review. NOT restarting.")
         break
-    if gained == -2:
+    if killed_zero_yield:
         needs_human("killed for zero yield — needs human review. NOT restarting.")
         break
     if restarts >= MAX_RESTARTS:
