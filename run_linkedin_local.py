@@ -961,11 +961,45 @@ except Exception as e:
 _orig_upload_resume = R.upload_resume
 
 
+_resume_upload_tried = False   # one fresh upload per process (the 09-08 stall risk is per attempt)
+
+
+def _resume_label(modal, radio) -> str:
+    try:
+        rid = radio.get_attribute("id")
+        lab = modal.find_element(By.XPATH, f".//label[@for='{rid}']") if rid else None
+        return " ".join((lab.text if lab is not None else "").split())
+    except Exception:
+        return ""
+
+
 def _patched_upload_resume(modal, resume):
+    # 2026-10-01: "Previous resume (already selected)" meant whatever LinkedIn last used, never
+    # checked against the current resume. Prefer the stored resume whose name matches
+    # default_resume_path; if LinkedIn has no copy yet, upload it once per process.
+    global _resume_upload_tried
     try:
         if not modal.find_elements(By.NAME, "file"):
             return _orig_upload_resume(modal, resume)  # not a resume step
         _radios = modal.find_elements(By.XPATH, ".//input[@type='radio']")
+        _want = os.path.splitext(os.path.basename(resume or ""))[0].lower()
+        _labels = [(_r, _resume_label(modal, _r)) for _r in _radios]
+        R.print_lg("Resume step: stored resumes " + " | ".join(l[:80] for _, l in _labels)
+                   + f" ; want '{_want}'")
+        _match = next((r for r, l in _labels if _want and _want in l.lower().replace(" ", "_")), None)
+        if _match is not None:
+            try:
+                if not _match.is_selected():
+                    _rid = _match.get_attribute("id")
+                    modal.find_element(By.XPATH, f".//label[@for='{_rid}']").click()
+                    time.sleep(1.0)
+                return True, os.path.basename(resume)
+            except Exception as e:
+                R.print_lg("Selecting the current resume failed:", e)
+        elif _want and not _resume_upload_tried:
+            _resume_upload_tried = True
+            R.print_lg(f"Current resume '{_want}' is not stored on LinkedIn yet; uploading it once.")
+            return _orig_upload_resume(modal, resume)
         for _r in _radios:
             try:
                 if _r.is_selected():
