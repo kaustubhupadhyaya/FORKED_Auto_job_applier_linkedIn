@@ -35,6 +35,10 @@ ARM_FILE = LOGS / "LINKEDIN_UAE_ARMED"
 JOBS_LOG = LOGS / "linkedin_uae_jobs.jsonl"
 LEDGER = LOGS / "linkedin_uae_unanswered.jsonl"
 CYCLES_LOG = LOGS / "linkedin_region_cycles.jsonl"
+AI_LOG = LOGS / "ai_answers.jsonl"
+# written when live submissions could not be verified on LinkedIn twice in one pass; the live pass stays off until a human has
+# looked (delete the file to resume): a Submit click that LinkedIn does not show as applied is either a broken check or lost work
+VERIFY_STOP = LOGS / "LINKEDIN_UAE_VERIFY_STOPPED"
 SHOTS = LOGS / "uae-evidence"
 FACTS_PKG = Path(r"C:\Users\Admin\GitHub\job-tracker\portal_kit")
 
@@ -95,10 +99,15 @@ def _load(path: Path, name: str):
 
 
 def _applied_today() -> int:
-    """Live applications today, counted from the per-job rows (written the moment a job is submitted, so a crash cannot lose them)."""
+    """Live applications today, counted from the per-job rows (written the moment a job is submitted, so a crash cannot lose them).
+    A submission that LinkedIn did not show as applied (a verify_failed row and no verified row after it) does not use up the quota."""
     today = date.today().isoformat()
-    return sum(1 for r in _read_jsonl(JOBS_LOG)
-               if r.get("outcome") == "applied" and r.get("mode") == "live" and str(r.get("ts", ""))[:10] == today)
+    rows = _read_jsonl(JOBS_LOG)
+    applied = {str(r.get("job_id")) for r in rows
+               if r.get("outcome") == "applied" and r.get("mode") == "live" and str(r.get("ts", ""))[:10] == today}
+    failed = {str(r.get("job_id")) for r in rows if r.get("outcome") == "verify_failed" and r.get("mode") == "live"}
+    verified = {str(r.get("job_id")) for r in rows if r.get("outcome") == "verified" and r.get("mode") == "live"}
+    return len(applied - (failed - verified))
 
 
 # ------------------------------------------------------------------ per-pass state
@@ -116,6 +125,8 @@ class Pass:
         self.max_minutes = int(arm.get("max_minutes", 45 if mode == "inventory" else 60))
         self.handled = self._handled_ids()
         self.seen: set = set()                      # job ids already opened in this pass (a job can come up under several search terms)
+        self.unverified = 0                         # live submissions this pass that LinkedIn did not show as applied
+        self.ai = None                              # the AI answerer module, loaded by _uae_pass only when the arming file asks for it
 
     def _handled_ids(self) -> set:
         """Jobs not worth opening again: applied, or skipped under the same facts file and resolver. A job inventoried as answerable
@@ -123,7 +134,7 @@ class Pass:
         done = set()
         for r in _read_jsonl(JOBS_LOG):
             o, same = r.get("outcome"), r.get("facts_rev") == self.facts.rev
-            if o == "applied" or (same and o in ("skipped_unanswerable", "skipped_job")) or (same and o == "would_apply" and self.mode == "inventory"):
+            if o == "applied" or (same and o in ("skipped_unanswerable", "skipped_job", "held_ai")) or (same and o == "would_apply" and self.mode == "inventory"):
                 done.add(str(r.get("job_id")))
         return done
 
@@ -160,7 +171,7 @@ class Pass:
         j["really_applied"] = outcome == "applied"
         self.counts[outcome] += 1
         _jsonl(JOBS_LOG, {k: v for k, v in j.items() if k not in ("done", "really_applied", "awaiting_done", "first_page_seen")} | {"outcome": outcome, "reason": reason[:300]})
-        if outcome in ("applied", "skipped_unanswerable", "skipped_job") or (outcome == "would_apply" and self.mode == "inventory"):
+        if outcome in ("applied", "skipped_unanswerable", "skipped_job", "held_ai") or (outcome == "would_apply" and self.mode == "inventory"):
             self.handled.add(j["job_id"])
         if outcome == "applied":
             self.quota_left -= 1
@@ -192,6 +203,112 @@ class Pass:
 
 
 S: Pass | None = None
+
+
+# ------------------------------------------------------------------ verification: LinkedIn itself must show the job as applied
+def _applied_marker(job_id: str) -> str:
+    """Why LinkedIn now shows this job as applied, or "" when it does not (yet). Two signals the bot's own already-applied checks rely on
+    (runAiBot.py): the job card's footer state, and the 'See application' link the detail pane shows once a job is applied."""
+    d = _R.driver
+    try:
+        for el in d.find_elements(By.XPATH, f"//*[@data-occludable-job-id='{job_id}']//*[contains(@class,'job-card-container__footer-job-state')]"):
+            if (el.text or "").strip() == "Applied":
+                return "the job card's footer says Applied"
+    except Exception:
+        pass
+    try:
+        m = re.search(r"currentJobId=(\d+)", d.current_url or "")
+        # the pane counts only when the URL names THIS job: a pane left on an older, applied neighbour must not verify this one
+        if m and m.group(1) == job_id and d.find_elements(By.CLASS_NAME, "jobs-s-apply__application-link"):
+            return "the job pane shows the 'See application' link"
+    except Exception:
+        pass
+    return ""
+
+
+def _dump_dom(job_id: str) -> None:
+    """A check that found no Applied marker: keep the real DOM around the apply area and the job's card, so the selectors can be corrected from
+    evidence instead of guessed. Only reads; never raises."""
+    try:
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        parts = []
+        for sel in (".jobs-s-apply", ".jobs-apply-button--top-card", ".job-details-jobs-unified-top-card__container--two-pane",
+                    ".jobs-unified-top-card"):
+            for el in _R.driver.find_elements(By.CSS_SELECTOR, sel)[:1]:
+                parts.append(f"<!-- {sel} -->\n" + (el.get_attribute("outerHTML") or "")[:12000])
+        for el in _R.driver.find_elements(By.XPATH, f"//*[@data-occludable-job-id='{job_id}']")[:1]:
+            parts.append("<!-- the job's card -->\n" + (el.get_attribute("outerHTML") or "")[:8000])
+        parts.append(f"<!-- url: {_R.driver.current_url} -->")
+        (SHOTS / f"{datetime.now():%Y%m%d_%H%M%S}-not-verified-{job_id}.html").write_text("\n\n".join(parts), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_calib = {"ok": 0, "bad": 0}
+
+
+def _calibrate_card(card, job_id: str) -> None:
+    """Read-only check of the verification's card lookup on the real page: where the bot's own lookup (on the card element) says Applied, the
+    lookup used for verification (by job id, from the page root) must say it too. Logged for the first few such cards of a run."""
+    if _calib["ok"] + _calib["bad"] >= 4:
+        return
+    try:
+        if not any((e.text or "").strip() == "Applied" for e in card.find_elements(By.CLASS_NAME, "job-card-container__footer-job-state")):
+            return
+        mine = bool(_applied_marker(job_id))
+        _calib["ok" if mine else "bad"] += 1
+        _note(f"uae: calibration: card {job_id} says Applied; the verification lookup {'agrees' if mine else 'DISAGREES (selector needs a fix)'}")
+    except Exception:
+        pass
+
+
+def _post_submit_evidence() -> None:
+    """What LinkedIn shows right after the Submit click (its confirmation wording was never observed before the first live run): kept on the
+    applied row and as a screenshot. Only reads; never raises."""
+    try:
+        time.sleep(2.0)
+        modals = _R.driver.find_elements(By.CSS_SELECTOR, ".jobs-easy-apply-modal, .artdeco-modal")
+        S.job["post_submit"] = " ".join((modals[0].text or "").split())[:300] if modals else "(no modal on screen)"
+        S.screenshot("post-submit")
+    except Exception:
+        pass
+
+
+def _verify_after_submit(job: dict, applied_ts: str) -> None:
+    """Right after a live Submit: look for LinkedIn's own Applied state (up to 15 s: the card and pane update a moment after the modal closes)
+    and write a `verified` or `verify_failed` row joined to the applied row by job id. Only `verified` rows count towards earning the
+    dashboard back; a failed one gives its quota slot back, and two in one pass switch the live pass off until a human has looked. Never raises."""
+    how, err = "", ""
+    try:
+        for _ in range(5):
+            how = _applied_marker(job["job_id"])
+            if how:
+                break
+            time.sleep(3.0)
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:100]}"
+    base = {"ts": datetime.now().isoformat(timespec="seconds"), "mode": "live", "facts_rev": S.facts.rev, "job_id": job["job_id"],
+            "title": job["title"], "company": job["company"], "applied_ts": applied_ts}
+    if how:
+        S.counts["verified"] += 1
+        _jsonl(JOBS_LOG, base | {"outcome": "verified", "how": how})
+        _note(f"uae: verified on LinkedIn: {job['title']} | {job['company']} ({how})")
+        return
+    S.counts["verify_failed"] += 1
+    S.unverified += 1
+    S.quota_left += 1
+    S.screenshot("not-verified")
+    _dump_dom(job["job_id"])
+    _jsonl(JOBS_LOG, base | {"outcome": "verify_failed", "reason": err or "no Applied marker on the job card or pane within 15 s"})
+    _note(f"uae: NOT verified on LinkedIn: {job['title']} | {job['company']} ({S.unverified} this pass)")
+    if S.unverified >= 2:
+        _R.switch_number = 0
+        try:
+            VERIFY_STOP.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} two live submissions in one pass were not shown as applied by LinkedIn; "
+                                   "the live UAE pass stays off until you have looked (delete this file to resume).\n", encoding="utf-8")
+        except OSError:
+            pass
+        _note("uae: two submissions in one pass could not be verified; live pass stopped and switched off (see LINKEDIN_UAE_VERIFY_STOPPED)")
 
 
 # ------------------------------------------------------------------ reading and filling the Easy Apply questions
@@ -373,6 +490,37 @@ def _fill_inner(q: dict, ans, F) -> str:
     _fail(q, f"cannot fill a {kind} question", F)
 
 
+def _ai_rescue(q: dict, exc):
+    """(answer, exception). Only a REQUIRED question that no intent maps at all can reach the AI answerer (which re-checks that itself);
+    every other refusal (unconfirmed fact, visa, ID, relocation, compound, skill not on the resume...) stays a refusal, and so does every
+    decline or failure of the answerer. A used AI answer is logged in full to ai_answers.jsonl and marks the job."""
+    if S.ai is None or not q["required"] or exc.reason != "no intent maps this question":
+        return None, exc
+    try:
+        ans = S.ai.ai_answer(S.facts, q["label"], q["kind"], q["options"], numeric=q["numeric"], required=q["required"], ctx=S.ctx())
+    except Exception as x:
+        why = getattr(x, "reason", None) or f"{type(x).__name__}: {str(x)[:80]}"
+        return None, S.F.Unanswerable(f"{exc.reason}; the AI answerer declined: {why}"[:220], intent=exc.intent, facts=exc.facts)
+    S.job["ai_answered"] = True
+    _jsonl(AI_LOG, {"ts": datetime.now().isoformat(timespec="seconds"), "mode": S.mode, "job_id": S.job["job_id"], "title": S.job["title"],
+                    "company": S.job["company"], "question": q["label"], "kind": q["kind"], "options": q["options"][:12],
+                    "answer": ans.value, "audit": getattr(ans, "audit", {}), "facts_rev": S.facts.rev})
+    return ans, exc
+
+
+def _load_ai(F, facts, arm: dict):
+    """The AI answerer (job-tracker/portal_kit/ai_answer.py), loaded by path like the facts module. None when the file is missing or does not
+    load: the pass then simply has no AI. The answerer's fingerprint and its live/inventory setting join the facts revision, so jobs skipped
+    under another answerer (or none), or held back until the AI answers were approved, are looked at again."""
+    try:
+        mod = _load(FACTS_PKG / "ai_answer.py", "uae_ai_answer")
+        facts.rev = f"{facts.rev}-ai{mod.answerer_fingerprint()}{'L' if arm.get('ai_live') else 'I'}"
+        return mod
+    except Exception as e:
+        _note(f"uae: AI answerer not loaded ({type(e).__name__}: {str(e)[:100]}); no AI this pass")
+        return None
+
+
 def uae_answer_questions(modal, questions_list, work_location, job_description=None):
     """Replacement for R.answer_questions while the UAE pass runs: every answer from the facts, or the job is blocked.
 
@@ -398,17 +546,19 @@ def uae_answer_questions(modal, questions_list, work_location, job_description=N
                     try:
                         ans = S.facts.resolve(q["label"], q["kind"], q["options"], numeric=q["numeric"], required=q["required"], ctx=S.ctx())
                     except F.Unanswerable as e:
-                        prefilled = bool(q["prev"]) and str(q["prev"]).strip().lower() not in ("select an option", "false")
-                        if q["required"] or prefilled:
-                            # an optional question nobody can answer stays blank, but not when LinkedIn already filled it in from an
-                            # older application: that value would be submitted unseen
-                            S.block(q["label"], q["kind"], e)
-                            raise
-                        break
+                        ans, e = _ai_rescue(q, e)
+                        if ans is None:
+                            prefilled = bool(q["prev"]) and str(q["prev"]).strip().lower() not in ("select an option", "false")
+                            if q["required"] or prefilled:
+                                # an optional question nobody can answer stays blank, but not when LinkedIn already filled it in from an
+                                # older application: that value would be submitted unseen
+                                S.block(q["label"], q["kind"], e)
+                                raise e
+                            break
                     shown = _fill(q, ans, F)
                     S.job["qa"].append({"q": q["label"][:120], "kind": q["kind"], "intent": ans.intent, "facts": list(ans.facts),
                                         "answer": ("<keep>" if ans.keep else "<salary>" if ans.intent.startswith("salary") else shown[:80]),
-                                        "proposed": ans.proposed})
+                                        "proposed": ans.proposed, "ai": bool(getattr(ans, "audit", None))})
                     if ans.proposed:
                         S.job["uses_proposed"] = True
                     questions_list.add((q["label"], shown, q["kind"], q["prev"]))
@@ -459,6 +609,7 @@ def _patches(R) -> dict:
         res = orig["get_job_main_details"](job, blacklisted_companies, rejected_jobs)
         job_id, title, company, location, style, skip = res
         if skip:
+            _calibrate_card(job, str(job_id))
             return res
         if str(job_id) in S.handled or str(job_id) in S.seen:
             R.print_lg(f'UAE pass: "{title} | {company}" was already handled. Skipping.')
@@ -509,8 +660,8 @@ def _patches(R) -> dict:
             # so nothing LinkedIn pre-filled on it goes through unseen. `driver` is the modal element in this call.
             S.job["first_page_seen"] = True
             uae_answer_questions(driver, set(), "", None)
-        if text == "Done" and click and S.mode == "inventory" and (S.job or {}).get("awaiting_done"):
-            S.job["awaiting_done"] = False          # the modal is already discarded; do not wait for a button that is not there
+        if text == "Done" and click and (S.job or {}).get("awaiting_done"):
+            S.job["awaiting_done"] = False          # the modal is already discarded (inventory, or a held job); do not wait for a button that is not there
             return True
         if text == "Submit application" and click:
             if S.job is None or S.job.get("done"):
@@ -529,7 +680,9 @@ def _patches(R) -> dict:
                 # the bot's own except path discards the modal after this refusal
                 R.print_lg(f"UAE pass: Submit refused, job is blocked ({blocked[:90]}).")
                 return False
-            if S.mode == "inventory" or S.job.get("uses_proposed"):
+            # AI-written selections are never submitted until the user has read the first ones and set "ai_live" in the arming file
+            hold_ai = S.mode == "live" and bool(S.job.get("ai_answered")) and not S.arm.get("ai_live")
+            if S.mode == "inventory" or S.job.get("uses_proposed") or hold_ai:
                 # would_apply only when a Submit button is really there: the bot's finally asks for Submit after a stuck loop, a
                 # timeout or an unread page too, and those jobs are not "answered completely"
                 if not orig["wait_span_click"](driver, "Submit application", 2, False, True, False):
@@ -537,8 +690,12 @@ def _patches(R) -> dict:
                     S.finish("failed", "the flow ended before a Submit step (stuck, timed out or an unread page)")
                     return False
                 S.screenshot("would-apply")
-                S.finish("would_apply", "every question was answered from the facts" +
-                         ("; some answers use PROPOSED facts" if S.job["uses_proposed"] else ""))
+                if hold_ai:
+                    S.finish("held_ai", "answered, but some answers were chosen by the AI answerer and are held until you approve them (ai_live)")
+                else:
+                    S.finish("would_apply", "every question was answered from the facts" +
+                             ("; some answers use PROPOSED facts" if S.job["uses_proposed"] else "") +
+                             ("; some answers were chosen by the AI answerer" if S.job.get("ai_answered") else ""))
                 R.print_lg("UAE pass: inventory, so the application is discarded instead of submitted.")
                 try:
                     R.discard_job()
@@ -546,7 +703,10 @@ def _patches(R) -> dict:
                     pass
                 S.job["awaiting_done"] = True       # the bot takes True as "submitted" and looks for Done; see above
                 return True
-        return orig["wait_span_click"](driver, text, timeout, click, scroll, scrollTop)
+        res = orig["wait_span_click"](driver, text, timeout, click, scroll, scrollTop)
+        if res and click and text == "Submit application" and S.job is not None and not S.job.get("done"):
+            _post_submit_evidence()                 # a real live Submit: keep what LinkedIn shows next
+        return res
 
     def upload_resume(modal, resume):
         ok, label = orig["upload_resume"](modal, resume)
@@ -568,9 +728,13 @@ def _patches(R) -> dict:
             S.finish("failed", "Submit did not complete (date applied still Pending)")
             return
         S.finish("applied", "")
-        return orig["submitted_jobs"](job_id, title, company, work_location, work_style, description, experience_required, skills, hr_name,
-                                      hr_link, resume, reposted, date_listed, date_applied, job_link, application_link, questions_list,
-                                      connect_request)
+        job_row = S.job
+        res = orig["submitted_jobs"](job_id, title, company, work_location, work_style, description, experience_required, skills, hr_name,
+                                     hr_link, resume, reposted, date_listed, date_applied, job_link, application_link, questions_list,
+                                     connect_request)
+        # the history row is written first; then LinkedIn's own Applied state decides whether this counts (see _verify_after_submit)
+        _verify_after_submit(job_row, date_applied.isoformat(timespec="seconds") if hasattr(date_applied, "isoformat") else str(date_applied))
+        return res
 
     def failed(job_id, job_link, resume, date_listed, error, exception, application_link, screenshot_name):
         # not passed on to the bot's failed-jobs CSV and evidence dumps: that list is the India run's, and a UAE skip is not a failure
@@ -631,7 +795,15 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
     F = _load(FACTS_PKG / "facts.py", "uae_facts")
     mode = arm["mode"]
     facts = F.Facts(live=(mode == "live"))
+    if arm.get("ai"):
+        ai_mod = _load_ai(F, facts, arm)                # may change facts.rev, which the Pass below reads
+    else:
+        ai_mod = None
     S = Pass(mode, arm, cfg, facts, F)
+    S.ai = ai_mod
+    if mode == "live" and VERIFY_STOP.exists():
+        _note("uae: live pass is off: LINKEDIN_UAE_VERIFY_STOPPED exists (submissions were not verified); India only")
+        return
     if mode == "live" and S.quota_left <= 0:
         _note(f"uae: today's quota of {arm.get('quota', cfg.DAILY_QUOTA)} is used; India only")
         return
@@ -677,7 +849,9 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
             R.easy_applied_count += S.counts["applied"]            # R counts a failed Submit as applied; only real ones count here
         if S.visits or sum(S.counts.values()):      # a pass that stopped at LinkedIn's limit banner did nothing: it must not start the min-gap clock
             _jsonl(CYCLES_LOG, {"start": start.isoformat(timespec="seconds"), "end": datetime.now().isoformat(timespec="seconds"), "region": "UAE",
-                                "mode": mode, "applied": S.counts["applied"], "would_apply": S.counts["would_apply"],
+                                "mode": mode, "applied": S.counts["applied"], "verified": S.counts["verified"],
+                                "verify_failed": S.counts["verify_failed"], "would_apply": S.counts["would_apply"],
+                                "held_ai": S.counts["held_ai"],
                                 "skipped_unanswerable": S.counts["skipped_unanswerable"], "skipped_job": S.counts["skipped_job"],
                                 "no_easy_apply": S.counts["no_easy_apply"], "failed": S.counts["failed"], "visits": S.visits,
                                 "facts_rev": facts.rev})

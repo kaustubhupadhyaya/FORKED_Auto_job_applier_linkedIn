@@ -25,6 +25,14 @@ GATE_MARKER = os.path.join(REPO, "logs", "GATE_STOPPED")
 # while today's marker exists (before this, a failed browser launch looped all night).
 NEEDS_HUMAN = os.path.join(REPO, "logs", "NEEDS_HUMAN")
 LAUNCH_FAILED_RC = 43   # run_linkedin_local.py: Chrome/driver could not start
+# 2026-10-02: at ~260 MB of free RAM Chrome could not start (rc 43) and that single failure parked
+# the bot for the rest of the day. Now: wait (bounded) for free memory before every launch, and
+# retry rc 43 a few times, 5 minutes apart, before asking for a human.
+RAM_MIN_MB = 1024
+RAM_WAIT_MAX_MIN = 20
+RAM_POLL_SEC = 30
+LAUNCH_RETRIES = 3
+LAUNCH_RETRY_WAIT_SEC = 300
 TRACKER_PATH = r"C:\Users\Admin\GitHub\job-tracker\track_job_applications.py"
 _tracker_proc = None
 
@@ -129,6 +137,43 @@ def parse_last_run_stats():
         return None, None
 
 
+def free_ram_mb():
+    """Available physical memory in MB (what Task Manager calls Available), or None if unreadable."""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return None
+        return int(st.ullAvailPhys // (1024 * 1024))
+    except Exception:
+        return None
+
+
+def wait_for_ram():
+    """Bounded: waits at most RAM_WAIT_MAX_MIN for RAM_MIN_MB of free memory, then launches anyway
+    (the rc 43 retry in the main loop is the second line of defence). Never an open loop."""
+    free = free_ram_mb()
+    if free is None or free >= RAM_MIN_MB:
+        return
+    slog(f"free RAM {free} MB < {RAM_MIN_MB} MB - waiting up to {RAM_WAIT_MAX_MIN} min before launching.")
+    deadline = time.time() + RAM_WAIT_MAX_MIN * 60
+    while time.time() < deadline:
+        time.sleep(RAM_POLL_SEC)
+        free = free_ram_mb()
+        if free is None or free >= RAM_MIN_MB:
+            slog(f"free RAM {free} MB - launching.")
+            return
+    slog(f"free RAM still {free} MB after {RAM_WAIT_MAX_MIN} min - launching anyway (bounded wait).")
+
+
 # Single-instance guard
 try:
     os.makedirs(os.path.dirname(LOCK), exist_ok=True)
@@ -151,8 +196,10 @@ except Exception as e:
 slog("started.")
 restarts = 0
 zero_apply_streak = 0
+launch_fails = 0   # consecutive rc 43 (browser could not start); separate from the restart budget
 
 while True:
+    wait_for_ram()   # before `start` is taken, so the wait never counts as run time
     attempt = restarts + 1
     before = saved_count()
     start = time.time()
@@ -231,9 +278,16 @@ while True:
         slog("daily Easy Apply limit reached — goal achieved, stopping supervisor.")
         break
     if rc == LAUNCH_FAILED_RC:
-        needs_human("browser/driver launch failed (rc 43) — NOT restarting; see logs/log.txt and "
-                    "logs/supervised-attempt-*.err.log.")
+        launch_fails += 1
+        if launch_fails <= LAUNCH_RETRIES:
+            slog(f"browser/driver launch failed (rc 43), retry {launch_fails}/{LAUNCH_RETRIES} in "
+                 f"{LAUNCH_RETRY_WAIT_SEC // 60} min (free RAM {free_ram_mb()} MB).")
+            time.sleep(LAUNCH_RETRY_WAIT_SEC)
+            continue
+        needs_human(f"browser/driver launch failed (rc 43) {launch_fails} times in a row — NOT restarting; "
+                    "see logs/log.txt and logs/supervised-attempt-*.err.log.")
         break
+    launch_fails = 0
     if rc == 42:
         needs_human("apply gate stop (modal missing) — cooling off, needs human review. NOT restarting.")
         break
