@@ -138,6 +138,15 @@ notice_period_months = str(notice_period//30)
 notice_period_weeks = str(notice_period//7)
 notice_period = str(notice_period)
 
+# "How many months of experience?" was answered with years_of_experience ("3" months, 2026-10-01).
+# Months come from the career start in config/questions.py (experience_start = "YYYY-MM").
+try:
+    _start_y, _start_m = (int(x) for x in str(experience_start).split("-")[:2])  # noqa: F405
+    _now = datetime.now()
+    experience_months = str((_now.year - _start_y) * 12 + _now.month - _start_m)
+except Exception:
+    experience_months = str(int(years_of_experience or 0) * 12)
+
 aiClient = None
 ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
 about_company_for_ai = None # TODO extract about company for AI
@@ -643,7 +652,8 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
 
             prev_answer = text.get_attribute("value")
             if not prev_answer or overwrite_previous_answers:
-                if 'experience' in label or 'years' in label: answer = years_of_experience
+                if 'experience' in label or 'years' in label:
+                    answer = experience_months if ('month' in label and 'year' not in label) else years_of_experience
                 elif 'phone' in label or 'mobile' in label: answer = phone_number
                 elif 'street' in label: answer = street
                 elif 'city' in label or 'location' in label or 'address' in label:
