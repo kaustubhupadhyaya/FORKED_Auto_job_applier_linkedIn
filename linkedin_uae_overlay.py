@@ -137,6 +137,7 @@ class Pass:
         self.unverified = 0                         # live submissions this pass that LinkedIn did not show as applied
         self.ai = None                              # the AI answerer module, loaded by _uae_pass only when the arming file asks for it
         self.ai_memo: dict = {}                     # (job, question, kind, options) -> what the AI answerer said: the bot re-asks a page that does not advance
+        self.ai_dead = False                        # the answerer's key or configuration was rejected in this pass
 
     def _handled_ids(self) -> set:
         """Jobs not worth opening again: applied, or skipped under the same facts file and resolver. A job inventoried as answerable
@@ -150,7 +151,7 @@ class Pass:
 
     def ctx(self) -> dict:
         j = self.job or {}
-        return {"region": "UAE", "title": j.get("title"), "company": j.get("company"), "location": j.get("location")}
+        return {"region": "UAE", "channel": "linkedin", "title": j.get("title"), "company": j.get("company"), "location": j.get("location")}
 
     def over_budget(self) -> str | None:
         if self.visits >= self.max_visits:
@@ -320,6 +321,22 @@ def _verify_after_submit(job: dict, applied_ts: str) -> None:
         except OSError:
             pass
         _note("uae: two submissions today could not be verified; live pass stopped and switched off (see LINKEDIN_UAE_VERIFY_STOPPED)")
+
+
+def _record_late_application(job_id: str, how: str, why: str) -> None:
+    """The bot's flow ended as "failed" or with the date still Pending, but LinkedIn itself already shows the job as applied: a Submit click
+    that was dispatched went through. Record the truth (an applied row, which charges the quota, and a verified row joined to it) instead of
+    a failure. The bot's own history CSV gets no row from this path. Never raises."""
+    try:
+        job = S.job
+        S.finish("applied", f"{why}; LinkedIn shows the job as applied")
+        _jsonl(JOBS_LOG, {"ts": datetime.now().isoformat(timespec="seconds"), "mode": "live", "facts_rev": S.facts.rev, "job_id": job_id,
+                          "title": job["title"], "company": job["company"], "applied_ts": job["ts"], "outcome": "verified",
+                          "how": how + " (found after the bot's flow had failed)"})
+        S.counts["verified"] += 1
+        _note(f"uae: recorded as applied and verified: {job['title']} | {job['company']} ({why})")
+    except Exception as e:
+        _note(f"uae: could not record a late application: {e!r}")
 
 
 # ------------------------------------------------------------------ reading and filling the Easy Apply questions
@@ -502,7 +519,10 @@ def _fill_inner(q: dict, ans, F) -> str:
 
 
 AI_KINDS = ("select", "radio", "text")                  # what _fill_inner can fill: there is no textarea branch, so no AI call for one
-AI_TRANSIENT_STAGES = ("transport", "breaker", "material")
+AI_TRANSIENT_STAGES = ("transport", "breaker", "material", "auth")
+# written when the answerer's key or configuration is rejected (HTTP 400/401/403/404): the model is not called again, by this or any later pass,
+# until a human has fixed the key and deleted the file (an outage that fixes itself is "transport" and is simply retried)
+AI_OFF = LOGS / "AI_ANSWERER_OFF"
 
 
 def _ai_rescue(q: dict, exc):
@@ -511,6 +531,9 @@ def _ai_rescue(q: dict, exc):
     decline or failure of the answerer. A used AI answer is logged in full to ai_answers.jsonl and marks the job."""
     if S.ai is None or not q["required"] or q["kind"] not in AI_KINDS or exc.reason != "no intent maps this question":
         return None, exc
+    if S.ai_dead:           # the key or configuration was rejected earlier in this pass: no more calls, and the job is retried, not skipped for good
+        return None, S.F.Unanswerable(f"{exc.reason}; the AI answerer is switched off (its key or configuration was rejected)"[:220],
+                                      intent="fill", facts=exc.facts)
     key = (S.job["job_id"], q["label"], q["kind"], tuple(q["options"]))
     if key in S.ai_memo:                                    # the bot re-asks a page that did not advance: one model call per question
         ans, why_not = S.ai_memo[key]
@@ -528,6 +551,14 @@ def _ai_rescue(q: dict, exc):
         # looked at again, instead of being skipped for good under this revision
         transient = not hasattr(x, "reason") or audit.get("stage") in AI_TRANSIENT_STAGES
         _jsonl(AI_LOG, row | {"answer": None, "declined": why, "stage": audit.get("stage"), "audit": audit})
+        if audit.get("stage") == "auth":
+            S.ai_dead = True
+            try:
+                AI_OFF.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} the AI answerer's key or configuration was rejected ({why[:120]}); "
+                                  "AI answers stay off until you have fixed the key and deleted this file.\n", encoding="utf-8")
+            except OSError:
+                pass
+            _note(f"uae: the AI answerer was rejected ({why[:80]}); AI answers are off until logs\\AI_ANSWERER_OFF is deleted")
         refusal = S.F.Unanswerable(f"{exc.reason}; the AI answerer declined: {why}"[:220], intent="fill" if transient else exc.intent, facts=exc.facts)
         S.ai_memo[key] = (None, refusal)
         return None, refusal
@@ -541,6 +572,10 @@ def _load_ai(F, facts, arm: dict):
     """The AI answerer (job-tracker/portal_kit/ai_answer.py), loaded by path like the facts module. None when the file is missing or does not
     load: the pass then simply has no AI. The answerer's fingerprint and its live/inventory setting join the facts revision, so jobs skipped
     under another answerer (or none), or held back until the AI answers were approved, are looked at again."""
+    if AI_OFF.exists():
+        _note("uae: AI answers are off: logs\\AI_ANSWERER_OFF exists (its key or configuration was rejected); delete it after fixing the key")
+        facts.rev = f"{facts.rev}-ai-off"           # jobs skipped meanwhile are looked at again once the AI is back (a different revision)
+        return None
     try:
         mod = _load(FACTS_PKG / "ai_answer.py", "uae_ai_answer")
         facts.rev = f"{facts.rev}-ai{mod.answerer_fingerprint()}{'L' if arm.get('ai_live') is True else 'I'}"
@@ -754,7 +789,11 @@ def _patches(R) -> dict:
         if S.mode == "inventory" or (S.job is not None and S.job.get("done")):
             return                              # nothing was submitted (or the job was already closed out); no history row
         if date_applied == "Pending":           # live, but the Submit click never completed: the bot would still write a history row
-            S.finish("failed", "Submit did not complete (date applied still Pending)")
+            late = _applied_marker(str(job_id))     # unless LinkedIn already shows the job as applied: then the click did go through
+            if late:
+                _record_late_application(str(job_id), late, "date applied still Pending")
+            else:
+                S.finish("failed", "Submit did not complete (date applied still Pending)")
             return
         S.finish("applied", "")
         job_row = S.job
@@ -778,11 +817,7 @@ def _patches(R) -> dict:
                 # element after the modal closed): when LinkedIn itself already shows this job as applied, record what happened
                 late = _applied_marker(str(job_id))
                 if late:
-                    S.finish("applied", f"the bot's flow raised after Submit ({error}) but LinkedIn shows the job as applied")
-                    _jsonl(JOBS_LOG, {"ts": datetime.now().isoformat(timespec="seconds"), "mode": "live", "facts_rev": S.facts.rev,
-                                      "job_id": str(job_id), "title": S.job["title"], "company": S.job["company"],
-                                      "applied_ts": S.job["ts"], "outcome": "verified", "how": late + " (found after the flow raised)"})
-                    S.counts["verified"] += 1
+                    _record_late_application(str(job_id), late, f"the bot's flow raised after Submit ({error})")
                     return
             S.finish(outcome, blocked or f"{error}: {str(exception)[:140]}")
 

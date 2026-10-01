@@ -263,7 +263,7 @@ while True:
                         pass
                 rc = proc.returncode
                 break
-            if elapsed >= YIELD_WINDOW_MIN and gained < YIELD_MIN_APPLIES:
+            if elapsed >= YIELD_WINDOW_MIN and 0 <= gained < YIELD_MIN_APPLIES:     # -1 = the log could not be read: unknown, not zero yield
                 slog(f"yield watchdog: +{gained} applies in {elapsed:.0f}min "
                      f"(< {YIELD_MIN_APPLIES}/{YIELD_WINDOW_MIN}min) — stopping grind.")
                 try:
@@ -303,6 +303,7 @@ while True:
                  f"{LAUNCH_RETRY_WAIT_SEC // 60} min (free RAM {free_ram_mb()} MB).")
             sweep_stale_browsers()      # a half-started Chrome still holding the profile makes the next start fail the same way
             time.sleep(LAUNCH_RETRY_WAIT_SEC)
+            sweep_stale_browsers()      # and again: a Chrome can finish starting during the wait
             continue
         needs_human(f"browser/driver launch failed (rc 43) {launch_fails} times in a row — NOT restarting; "
                     "see logs/log.txt and logs/supervised-attempt-*.err.log.")
