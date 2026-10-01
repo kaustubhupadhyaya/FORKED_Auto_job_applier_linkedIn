@@ -1278,5 +1278,16 @@ try:
 except Exception as e:
     _note(f"resume check skipped: {e!r}")
 
+# --- 12. UAE pass overlay ------------------------------------------------------------
+# Inert unless logs/LINKEDIN_UAE_ARMED holds a valid, unexpired arming (written on the user's go-ahead). Any failure to
+# load it must never touch the India run, so everything here is best effort.
+try:
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    import linkedin_uae_overlay as _uae
+    _uae.install(R, _note)
+except Exception as _e:
+    _note(f"UAE overlay not installed: {_e!r}")
+
 _note(f"hardened runner ready (user={R.username!r} from {_src}).")
 R.main()
