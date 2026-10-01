@@ -170,6 +170,8 @@ class Pass:
 
     def block(self, q_label: str, kind: str, exc) -> None:
         self.job["blocked"] = f"{q_label[:100]}: {exc.reason}"
+        # a Selenium hiccup or an unselectable resume is not a question without a fact: it is retried later, never listed as one
+        self.job["block_transient"] = exc.intent in ("fill", "resume")
         _jsonl(LEDGER, self.facts.ledger_row(q_label, kind, exc) | {"job_id": self.job["job_id"], "title": self.job["title"],
                                                                     "company": self.job["company"], "mode": self.mode,
                                                                     "ts": datetime.now().isoformat(timespec="seconds")})
@@ -177,8 +179,14 @@ class Pass:
     def screenshot(self, tag: str) -> None:
         try:
             SHOTS.mkdir(parents=True, exist_ok=True)
-            if len(list(SHOTS.glob("*.png"))) < 150:
-                _R.driver.save_screenshot(str(SHOTS / f"{datetime.now():%Y%m%d_%H%M%S}-{tag}-{(self.job or {}).get('job_id', '')}.png"))
+            shots = sorted(SHOTS.glob("*.png"))
+            if len(shots) >= 400:                   # keep the newest 300: evidence must not silently stop after a few passes
+                for old in shots[:100]:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            _R.driver.save_screenshot(str(SHOTS / f"{datetime.now():%Y%m%d_%H%M%S}-{tag}-{(self.job or {}).get('job_id', '')}.png"))
         except Exception:
             pass
 
@@ -218,8 +226,11 @@ def _read_question(el) -> dict | None:
         except Exception:
             pass
         s = Select(sel_els[0])
-        return {"kind": "select", "label": label, "options": [o.text for o in s.options], "prev": s.first_selected_option.text,
-                "numeric": False, "required": _required(sel_els[0]), "w": s}
+        # the phone-country-code list has about 250 entries and is never needed (the contact fields keep what LinkedIn pre-filled);
+        # reading every option text costs seconds per job, so its options are read only if the field turns out to be empty
+        lazy = "country code" in label.lower()
+        return {"kind": "select", "label": label, "options": [] if lazy else [o.text for o in s.options],
+                "prev": s.first_selected_option.text, "numeric": False, "required": _required(sel_els[0]), "w": s, "lazy_options": lazy}
     fs = el.find_elements(By.XPATH, './/fieldset[@data-test-form-builder-radio-button-form-component="true"]')
     if fs:
         radio = fs[0]
@@ -309,6 +320,8 @@ def _fill_inner(q: dict, ans, F) -> str:
             if q["prev"] and q["prev"].strip().lower() != "select an option":
                 return q["prev"]
             fb = _keep_fallback(ans, q)
+            if q.get("lazy_options"):
+                q["options"] = [o.text for o in w.options]
             want = next((o for o in q["options"] if fb and (fb.lower() in o.lower() or o.strip() == fb)), "")
             if not want:
                 _fail(q, f"no option to pre-fill '{q['label'][:40]}'", F)
@@ -411,6 +424,7 @@ def uae_answer_questions(modal, questions_list, work_location, job_description=N
     except Exception as e:
         if S.job is not None and not S.job.get("blocked"):
             S.job["blocked"] = f"answering failed unexpectedly: {type(e).__name__}: {str(e)[:120]}"
+            S.job["block_transient"] = True
         raise
     return questions_list
 
@@ -428,6 +442,20 @@ def _patches(R) -> dict:
         return orig["print_lg"](*msgs, **kw)
 
     def details(job, blacklisted_companies, rejected_jobs):
+        # Decide from the card's own id BEFORE the runner's per-job pacing wait (8-20 s) and card click: once the job pool is
+        # saturated every card is already handled, and the pass must neither burn that time nor outlive its budget.
+        try:
+            card_id = str(job.get_dom_attribute("data-occludable-job-id") or "")
+        except Exception:
+            card_id = ""
+        why = S.over_budget()
+        if why:
+            if R.switch_number:
+                R.switch_number = 0
+                _note(f"uae: {why} reached")
+            return (card_id or "unknown", "Unknown", "Unknown", "", "", True)
+        if card_id and (card_id in S.handled or card_id in S.seen):
+            return (card_id, "Unknown", "Unknown", "", "", True)
         res = orig["get_job_main_details"](job, blacklisted_companies, rejected_jobs)
         job_id, title, company, location, style, skip = res
         if skip:
@@ -462,7 +490,15 @@ def _patches(R) -> dict:
                 return
             try:
                 R.actions.send_keys(Keys.ESCAPE).perform()
+                time.sleep(1.0)
+                if not modal_open():                # Escape closed it outright: no prompt, so no Discard button to wait for
+                    return
                 orig["wait_span_click"](R.driver, "Discard", 3)
+            except Exception:
+                pass
+        if modal_open():                            # last resort: the runner's own discard, which also reloads the job page
+            try:
+                orig["discard_job"]()
             except Exception:
                 pass
 
@@ -485,6 +521,7 @@ def _patches(R) -> dict:
                     m = re.search(r"currentJobId=(\d+)", R.driver.current_url or "")
                     if m and m.group(1) != S.job["job_id"]:
                         S.job["blocked"] = f"the open page is job {m.group(1)}, not {S.job['job_id']}"
+                        S.job["block_transient"] = True         # a pane that lags behind the click, not a property of the job
                 except Exception:
                     pass
             blocked = S.job.get("blocked")
@@ -525,8 +562,8 @@ def _patches(R) -> dict:
 
     def submitted(job_id, title, company, work_location, work_style, description, experience_required, skills, hr_name, hr_link,
                   resume, reposted, date_listed, date_applied, job_link, application_link, questions_list, connect_request):
-        if S.mode == "inventory":
-            return                              # nothing was submitted; would_apply was recorded at the Submit step
+        if S.mode == "inventory" or (S.job is not None and S.job.get("done")):
+            return                              # nothing was submitted (or the job was already closed out); no history row
         if date_applied == "Pending":           # live, but the Submit click never completed: the bot would still write a history row
             S.finish("failed", "Submit did not complete (date applied still Pending)")
             return
@@ -541,8 +578,9 @@ def _patches(R) -> dict:
             blocked = S.job.get("blocked")
             if blocked:
                 S.screenshot("blocked")
-            S.finish("skipped_unanswerable" if blocked else "skipped_job" if "Skipped" in str(application_link) else "failed",
-                     blocked or f"{error}: {str(exception)[:140]}")
+            outcome = (("failed" if S.job.get("block_transient") else "skipped_unanswerable") if blocked
+                       else "skipped_job" if "Skipped" in str(application_link) else "failed")
+            S.finish(outcome, blocked or f"{error}: {str(exception)[:140]}")
 
     def external(pagination_element, job_id, job_link, resume, date_listed, application_link, screenshot_name):
         if S.job is not None:
@@ -553,6 +591,18 @@ def _patches(R) -> dict:
     R.submitted_jobs, R.failed_job, R.get_applied_job_ids, R.external_apply = submitted, failed, get_applied, external
     R.discard_job, R.upload_resume, R.print_lg = discard_job, upload_resume, print_lg
     return orig
+
+
+class _Terms(list):
+    """The search terms, which stop being handed out once the pass is over its budget (each remaining term would otherwise still load
+    a search page and its filters before finding nothing to do)."""
+
+    def __iter__(self):
+        for term in list.__iter__(self):
+            if S is not None and S.over_budget():
+                _note(f"uae: {S.over_budget()} reached; the remaining search terms are skipped")
+                return
+            yield term
 
 
 def _write_shortlist() -> None:
@@ -586,7 +636,8 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
         _note(f"uae: today's quota of {arm.get('quota', cfg.DAILY_QUOTA)} is used; India only")
         return
     gap_h = float(arm.get("min_gap_hours", 3))          # the supervisor restarts the bot often; one UAE pass per few hours is plenty
-    ran = [c for c in _read_jsonl(CYCLES_LOG) if c.get("region") == "UAE" and c.get("mode") == mode]
+    # a changed facts file or resolver (a different revision) lifts the gap: the user will want the rerun at once
+    ran = [c for c in _read_jsonl(CYCLES_LOG) if c.get("region") == "UAE" and c.get("mode") == mode and c.get("facts_rev") == facts.rev]
     if ran and gap_h > 0:
         try:
             ago = (datetime.now() - datetime.fromisoformat(str(ran[-1]["start"])[:19])).total_seconds() / 3600
@@ -606,7 +657,7 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
         R.bad_words = list(saved_attrs["bad_words"]) + list(cfg.BAD_WORDS_EXTRA)
         terms = list(cfg.SEARCH_TERMS)
         k = (date.today().toordinal() * 3) % len(terms)           # rotate the start so every term gets its turn over the days
-        terms = terms[k:] + terms[:k]
+        terms = _Terms(terms[k:] + terms[:k])
         saved_funcs = _patches(R)
         _note(f"uae: {mode} pass starts ({len(terms)} terms, facts {facts.rev}, quota left {S.quota_left if mode == 'live' else 'n/a'})")
         orig_apply(terms)
@@ -624,11 +675,12 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
             setattr(R, n, v)
         if mode == "live":
             R.easy_applied_count += S.counts["applied"]            # R counts a failed Submit as applied; only real ones count here
-        _jsonl(CYCLES_LOG, {"start": start.isoformat(timespec="seconds"), "end": datetime.now().isoformat(timespec="seconds"), "region": "UAE",
-                            "mode": mode, "applied": S.counts["applied"], "would_apply": S.counts["would_apply"],
-                            "skipped_unanswerable": S.counts["skipped_unanswerable"], "skipped_job": S.counts["skipped_job"],
-                            "no_easy_apply": S.counts["no_easy_apply"], "failed": S.counts["failed"], "visits": S.visits,
-                            "facts_rev": facts.rev})
+        if S.visits or sum(S.counts.values()):      # a pass that stopped at LinkedIn's limit banner did nothing: it must not start the min-gap clock
+            _jsonl(CYCLES_LOG, {"start": start.isoformat(timespec="seconds"), "end": datetime.now().isoformat(timespec="seconds"), "region": "UAE",
+                                "mode": mode, "applied": S.counts["applied"], "would_apply": S.counts["would_apply"],
+                                "skipped_unanswerable": S.counts["skipped_unanswerable"], "skipped_job": S.counts["skipped_job"],
+                                "no_easy_apply": S.counts["no_easy_apply"], "failed": S.counts["failed"], "visits": S.visits,
+                                "facts_rev": facts.rev})
         _write_shortlist()
         _note(f"uae: {mode} pass ended: {dict(S.counts)} over {S.visits} jobs")
 
