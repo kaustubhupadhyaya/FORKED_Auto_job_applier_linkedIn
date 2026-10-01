@@ -1027,6 +1027,20 @@ def _patched_upload_resume(modal, resume):
 R.upload_resume = _patched_upload_resume
 _note("upload_resume patched (prefer existing resume).")
 
+# runAiBot turns useNewResume off after the first successful resume step, after which LinkedIn's
+# preselection (last-used resume) decides silently and the history CSV says "Previous resume".
+# Re-arm it on every question page so each job's resume step is checked, selected and recorded.
+_orig_answer_questions = R.answer_questions
+
+
+def _answer_questions_recheck_resume(*args, **kwargs):
+    R.useNewResume = True
+    return _orig_answer_questions(*args, **kwargs)
+
+
+R.answer_questions = _answer_questions_recheck_resume
+_note("resume step re-checked on every job.")
+
 # --- 10. Modal-missing gate detector ----------------------------------------------
 # When LinkedIn throttles/gates apply actions, the Easy Apply button still
 # renders but no modal ever opens (TimeoutException, empty message). Grinding

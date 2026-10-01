@@ -490,7 +490,31 @@ def answer_common_questions(label: str, answer: str) -> str:
     # "Are you serving your notice period?" also fell to the Yes default; the user is not (2026-09-24).
     elif 'serving' in label and 'notice' in label:
         answer = 'No'
+    # "If selected, I agree to join at a salary of Rs. 16,000/month?" -> Yes (2026-10-01). Agree only
+    # when the stated pay is at least the current CTC.
+    elif any(w in label for w in ('agree', 'okay', 'ok with', 'comfortable', 'accept', 'fine with', 'willing')) \
+            and any(w in label for w in ('salary', 'ctc', 'stipend', 'package', 'compensation', 'pay ')):
+        offered = _offered_annual_pay(label)
+        if offered is not None:
+            answer = 'Yes' if offered >= int(current_ctc) else 'No'
     return answer
+
+
+def _offered_annual_pay(label: str) -> float | None:
+    """Annual amount named in a question ('Rs. 16,000/month', '6 LPA', 'INR 12,00,000'), or None."""
+    m = re.search(r'(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d+)?)\s*(k|lakhs?|lacs?|lpa)?', label) \
+        or re.search(r'([\d.]+)\s*(lakhs?|lacs?|lpa)\b', label)
+    if not m:
+        return None
+    amount = float(m.group(1).replace(',', ''))
+    unit = (m.group(2) or '').lower()
+    if unit == 'k':
+        amount *= 1000
+    elif unit:
+        amount *= 100000
+    if re.search(r'(/|per|a)\s*month|monthly|p\.?m\b', label[m.end():m.end() + 25]):
+        amount *= 12
+    return amount
 
 
 # Function to answer the questions for Easy Apply
