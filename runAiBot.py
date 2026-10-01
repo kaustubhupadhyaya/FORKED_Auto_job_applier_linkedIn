@@ -474,6 +474,10 @@ def upload_resume(modal: WebElement, resume: str) -> tuple[bool, str]:
 # Function to answer common questions for Easy Apply
 def answer_common_questions(label: str, answer: str) -> str:
     if 'sponsorship' in label or 'visa' in label: answer = require_visa
+    # Unknown yes/no questions default to "Yes", which answered "Are you a fresher or do you have no more than
+    # 1 year of experience?" with Yes (seen 2026-10-01). Experience is years_of_experience, never fresher.
+    elif 'fresher' in label or re.search(r'(no more than|less than|under|at most)\s+(1|one)\s+year', label):
+        answer = 'Yes' if int(years_of_experience or 0) < 1 else 'No'
     return answer
 
 
