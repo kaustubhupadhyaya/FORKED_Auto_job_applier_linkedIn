@@ -344,16 +344,25 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     job_details_button = job.find_element(By.TAG_NAME, 'a')  # job.find_element(By.CLASS_NAME, "job-card-list__title")  # Problem in India
     scroll_to_view(driver, job_details_button, True)
     job_id = job.get_dom_attribute('data-occludable-job-id')
-    title = job_details_button.text
-    title = title[:title.find("\n")]
+    title = job_details_button.text.split("\n")[0].strip()      # was title[:title.find("\n")]: with no newline in the text it dropped the last letter
     # company = job.find_element(By.CLASS_NAME, "job-card-container__primary-description").text
     # work_location = job.find_element(By.CLASS_NAME, "job-card-container__metadata-item").text
-    other_details = job.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__subtitle').text
-    index = other_details.find(' · ')
-    company = other_details[:index]
-    work_location = other_details[index+3:]
-    work_style = work_location[work_location.rfind('(')+1:work_location.rfind(')')]
-    work_location = work_location[:work_location.rfind('(')].strip()
+    # 2026-10-02: the card now carries the company alone in the subtitle and "Location (Style)" in a separate caption element (seen in the
+    # bot's own page captures since at least 10-01). The old code looked for "Company · Location (Style)" in the subtitle, found no " · ",
+    # and sliced with find() == -1: every company and title lost its last letter and the "location" was a piece of the company name.
+    # Both layouts are read.
+    other_details = job.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__subtitle').text.strip()
+    if ' · ' in other_details:
+        company, _, loc_style = other_details.partition(' · ')
+    else:
+        company = other_details
+        try:
+            loc_style = job.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__caption').text.strip()
+        except NoSuchElementException:
+            loc_style = ""
+    company = company.split("\n")[0].strip()
+    work_style = loc_style[loc_style.rfind('(')+1:loc_style.rfind(')')] if '(' in loc_style else ""
+    work_location = (loc_style[:loc_style.rfind('(')] if '(' in loc_style else loc_style).strip()
     
     # Skip if previously rejected due to blacklist or already applied
     skip = False

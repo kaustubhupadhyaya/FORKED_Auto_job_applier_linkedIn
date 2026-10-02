@@ -15,6 +15,7 @@ unchanged bot. Facts live outside the repo (C:\\Users\\Admin\\.secrets\\gulf_fac
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -90,6 +91,18 @@ def _armed() -> dict | None:
     return arm
 
 
+def _code_rev() -> str:
+    """A short hash of this overlay and of the bot's own source. It joins the facts revision, so a skip decided under older logic (the first
+    real pass skipped 48 jobs as 'not in the UAE' because the bot's card parsing was broken) is looked at again after any change to either."""
+    h = hashlib.sha1()
+    for p in (Path(__file__), REPO / "runAiBot.py"):
+        try:
+            h.update(p.read_bytes())
+        except OSError:
+            h.update(b"?")
+    return h.hexdigest()[:6]
+
+
 def _load(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -138,6 +151,7 @@ class Pass:
         self.ai = None                              # the AI answerer module, loaded by _uae_pass only when the arming file asks for it
         self.ai_memo: dict = {}                     # (job, question, kind, options) -> what the AI answerer said: the bot re-asks a page that does not advance
         self.ai_dead = False                        # the answerer's key or configuration was rejected in this pass
+        self.loc_skips = 0                          # cards rejected by the location on the card itself
 
     def _handled_ids(self) -> set:
         """Jobs not worth opening again: applied, or skipped under the same facts file and resolver. A job inventoried as answerable
@@ -251,6 +265,36 @@ def _dump_dom(job_id: str) -> None:
             parts.append("<!-- the job's card -->\n" + (el.get_attribute("outerHTML") or "")[:8000])
         parts.append(f"<!-- url: {_R.driver.current_url} -->")
         (SHOTS / f"{datetime.now():%Y%m%d_%H%M%S}-not-verified-{job_id}.html").write_text("\n\n".join(parts), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _card_fields(card) -> tuple:
+    """(title, company, "Location (Style)") read from a job card's own elements the way the bot's get_job_main_details does since the card
+    layout changed: the company alone in the subtitle and the location in a separate caption (the older "Company · Location" subtitle is read
+    too). An empty string for whatever the card does not show. Never raises."""
+    def text(cls: str) -> str:
+        try:
+            return card.find_element(By.CLASS_NAME, cls).text.strip()
+        except Exception:
+            return ""
+    try:
+        title = card.find_element(By.TAG_NAME, "a").text.split("\n")[0].strip()
+    except Exception:
+        title = ""
+    sub = text("artdeco-entity-lockup__subtitle")
+    if " · " in sub:
+        company, _, loc = sub.partition(" · ")
+    else:
+        company, loc = sub, text("artdeco-entity-lockup__caption")
+    return title, company.split("\n")[0].strip(), loc.strip()
+
+
+def _dump_card(card, job_id: str) -> None:
+    """The real HTML of a card the pass rejected by location (the first two of a pass). Only reads; never raises."""
+    try:
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        (SHOTS / f"{datetime.now():%Y%m%d_%H%M%S}-card-{job_id}.html").write_text((card.get_attribute("outerHTML") or "")[:6000], encoding="utf-8")
     except Exception:
         pass
 
@@ -670,6 +714,16 @@ def _patches(R) -> dict:
             return (card_id or "unknown", "Unknown", "Unknown", "", "", True)
         if card_id and (card_id in S.handled or card_id in S.seen):
             return (card_id, "Unknown", "Unknown", "", "", True)
+        # The card shows its own location: a job outside the UAE is rejected here, before the bot clicks it and waits its per-job pacing
+        # (the first real pass spent 24 minutes of its 45 on 48 cards it then rejected one by one).
+        title0, company0, loc0 = _card_fields(job)
+        if card_id and loc0 and not any(w in loc0.lower() for w in S.cfg.UAE_LOCATION_WORDS):
+            S.begin(card_id, title0, company0, loc0, "", count=False)
+            S.finish("skipped_job", f"location is not in the UAE: {loc0}")
+            S.loc_skips += 1
+            if S.loc_skips <= 2:
+                _dump_card(job, card_id)             # evidence of what a rejected card looks like, in case this gate is ever wrong
+            return (card_id, title0 or "Unknown", company0 or "Unknown", loc0, "", True)
         res = orig["get_job_main_details"](job, blacklisted_companies, rejected_jobs)
         job_id, title, company, location, style, skip = res
         if skip:
@@ -870,6 +924,7 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
     F = _load(FACTS_PKG / "facts.py", "uae_facts")
     mode = arm["mode"]
     facts = F.Facts(live=(mode == "live"))
+    facts.rev = f"{facts.rev}-c{_code_rev()}"       # facts + resolver + THIS pass's and the bot's code (see _code_rev)
     if arm.get("ai"):
         ai_mod = _load_ai(F, facts, arm)                # may change facts.rev, which the Pass below reads
     else:
@@ -931,6 +986,10 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
                                 "no_easy_apply": S.counts["no_easy_apply"], "failed": S.counts["failed"], "visits": S.visits,
                                 "facts_rev": facts.rev})
         _write_shortlist()
+        if S.visits == 0 and S.counts["skipped_job"] >= 10:
+            # exactly what a changed card layout looks like (the first real pass: 48 cards, every one "not in the UAE", none opened)
+            _note(f"uae: WARNING: {S.counts['skipped_job']} cards were rejected as outside the UAE and none was opened; if that is not the "
+                  "search's real result, the card layout has changed again (HTML of the first rejected cards is in logs\\uae-evidence)")
         _note(f"uae: {mode} pass ended: {dict(S.counts)} over {S.visits} jobs")
 
 
