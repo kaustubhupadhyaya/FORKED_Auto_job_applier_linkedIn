@@ -168,6 +168,8 @@ class Pass:
         return {"region": "UAE", "channel": "linkedin", "title": j.get("title"), "company": j.get("company"), "location": j.get("location")}
 
     def over_budget(self) -> str | None:
+        if self.mode == "live" and self.quota_left <= 0:
+            return "daily quota"                    # the cap on submissions is a budget too: the remaining terms and cards need not even be loaded
         if self.visits >= self.max_visits:
             return f"visit budget of {self.max_visits}"
         if time.time() - self.started > self.max_minutes * 60:
