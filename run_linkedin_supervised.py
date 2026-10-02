@@ -247,6 +247,8 @@ while True:
             sync_tracker()
             elapsed = (time.time() - attempt_start_ts) / 60
             cur = saved_count()
+            if before < 0 <= cur:
+                before = cur        # the log could not be read at launch: the first readable count is the baseline (else the watchdog stays blind all attempt)
             gained = (cur - before) if (cur >= 0 and before >= 0) else -1
             if gate_marker_fresh(attempt_start_ts):
                 slog("GATE_STOPPED marker appeared mid-run — terminating grind.")
@@ -315,6 +317,8 @@ while True:
     if killed_zero_yield:
         needs_human("killed for zero yield — needs human review. NOT restarting.")
         break
+    if gained and gained > 0:
+        restarts = 0                # a run that saved applications is progress, not a crash loop: the restart budget starts over
     if restarts >= MAX_RESTARTS:
         needs_human("max restarts used — stopping (needs human review).")
         break

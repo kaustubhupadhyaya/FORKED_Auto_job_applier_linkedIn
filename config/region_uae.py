@@ -29,17 +29,25 @@ DAILY_QUOTA = 12           # live applications a day in the UAE pass; the India 
 
 # A job's TITLE must name a data-engineering role the user would actually take, or the job is not even opened. LinkedIn pads a "Data Engineer"
 # search with unrelated jobs: the first real pass's answerable list held a nurse, an administrator and a perfume-shop Shopify developer.
-# Whole words or phrases, case-insensitive. "Data Analyst", "Data Scientist", "Platform Engineer" (DevOps), "Technology Lead" match nothing here
-# on purpose. ML/AI engineering titles belong to the later AI Engineer identity but are listed because a "Data Engineer" search also returns them.
+# The title is normalised first (Unicode NFKC, so a recruiter's mathematical-bold "Data Engineer" reads as plain text; lower case; hyphens, slashes,
+# dots and non-breaking spaces become spaces; plural "engineers" counts). A title passes when it holds a strong phrase (TITLE_ANY), matches a pattern
+# (TITLE_PATTERNS), or holds a bare technology word (TITLE_TECH) together with a role word (TITLE_ROLE): "Spark Developer" yes, "Spark Plug Mechanic" no.
+# "Data Analyst", "Data Scientist", "Platform Engineer" (DevOps) and "Technology Lead" match nothing on purpose. AI / ML engineer titles are NOT here:
+# they belong to the later AI Engineer identity (the resume this pass sends is the Data Platform one); MLOps is a platform role and stays.
 TITLE_ANY = (
-    "data engineer", "data engineering", "data platform", "data warehouse", "data warehousing", "data lake", "data lakehouse", "data pipeline",
-    "data pipelines", "data infrastructure", "data integration", "data developer", "data architect", "big data", "analytics engineer",
-    "analytic engineer", "cloud data", "etl", "elt", "dwh", "dataops", "mlops", "snowflake", "databricks", "pyspark", "spark", "airflow", "dbt",
-    "kafka", "bi developer", "bi engineer", "business intelligence developer", "business intelligence engineer",
-    "machine learning engineer", "ml engineer", "ai engineer", "genai engineer", "llm engineer",
+    "data engineer", "data engineering", "data platform", "data warehouse", "data warehousing", "data lake", "data lakehouse", "lakehouse engineer",
+    "data pipeline", "data infrastructure", "data integration", "data developer", "data architect", "big data", "analytics engineer",
+    "analytic engineer", "cloud data", "dataops", "mlops", "bi engineer", "bi engineering", "business intelligence engineer", "sql developer", "database developer", "database engineer", "azure data factory", "hadoop developer",
+    "hadoop engineer",
 )
+TITLE_PATTERNS = (
+    r"\bdata\b[^,;()]{0,25}\bengineer(s|ing)?\b",       # Data Platform Engineer, Data Quality Engineer, Data Lineage Engineer, Data Operations Engineer
+)
+TITLE_TECH = ("etl", "elt", "dwh", "spark", "pyspark", "airflow", "dbt", "kafka", "snowflake", "databricks", "hadoop", "informatica", "ssis", "talend")
+TITLE_ROLE = ("engineer", "engineers", "developer", "developers", "architect", "consultant", "specialist", "programmer", "lead")
 # Words that rule a job out even when a data word is in the title (the user has about three years of experience and is not looking for these).
-TITLE_NONE = ("intern", "internship", "trainee", "apprentice", "fresher", "graduate programme", "graduate program", "nurse", "teacher", "sales")
+# Kept short on purpose: anything else that is not a data role is already refused by the lists above ("Data Engineer (Sales Analytics)" is fine).
+TITLE_NONE = ("intern", "internship", "trainee", "apprentice", "fresher", "graduate programme", "graduate program", "scientist")
 
 # A job card's location must look like the UAE, or the job is skipped (a "United Arab Emirates" search can return remote roles elsewhere).
 UAE_LOCATION_WORDS = ("uae", "united arab emirates", "dubai", "abu dhabi", "sharjah", "ajman", "ras al khaimah", "fujairah",

@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
@@ -91,15 +92,31 @@ def _armed() -> dict | None:
     return arm
 
 
-def _code_rev() -> str:
-    """A short hash of this overlay and of the bot's own source. It joins the facts revision, so a skip decided under older logic (the first
-    real pass skipped 48 jobs as 'not in the UAE' because the bot's card parsing was broken) is looked at again after any change to either."""
+_CODE_BASE = ""
+
+
+def _code_base() -> str:
+    """Hash of the code this PROCESS loaded (the overlay, the bot, the runner, the bot's search settings), taken once in install(), before any later
+    edit changes the files on disk: a hash taken from disk at every pass would stamp old code with a new revision."""
     h = hashlib.sha1()
-    for p in (Path(__file__), REPO / "runAiBot.py"):
+    for p in (Path(__file__), REPO / "runAiBot.py", REPO / "run_linkedin_local.py", REPO / "config" / "search.py"):
         try:
             h.update(p.read_bytes())
         except OSError:
             h.update(b"?")
+    return h.hexdigest()
+
+
+def _code_rev() -> str:
+    """A short hash that joins the facts revision: the code the process loaded (_code_base) plus config/region_uae.py read NOW, because that file
+    (the title and location gates, the search terms, the bad words) is re-executed at every pass, so an edit takes effect without a restart and
+    must re-open what the old gate skipped. A skip decided under older logic (the first real pass skipped 48 jobs as 'not in the UAE' because the
+    bot's card parsing was broken) is looked at again after any such change."""
+    h = hashlib.sha1((_CODE_BASE or _code_base()).encode())
+    try:
+        h.update((REPO / "config" / "region_uae.py").read_bytes())
+    except OSError:
+        h.update(b"?")
     return h.hexdigest()[:6]
 
 
@@ -152,6 +169,12 @@ class Pass:
         self.ai_memo: dict = {}                     # (job, question, kind, options) -> what the AI answerer said: the bot re-asks a page that does not advance
         self.ai_dead = False                        # the answerer's key or configuration was rejected in this pass
         self.loc_skips = 0                          # cards rejected by the location on the card itself
+        self.cards_seen = 0                         # every card the pass looked at, including the ones it skipped without a row
+        self.uae_cards = 0                          # cards whose own location was in the UAE
+        self.placeholders = 0                       # cards still empty after scrolling to them
+        # roles (company + title) already applied to live: LinkedIn reposts the same role under new job ids
+        self.applied_keys = {_role_key(r.get("company"), r.get("title")) for r in _read_jsonl(JOBS_LOG)
+                             if r.get("outcome") == "applied" and r.get("mode") == "live"}
 
     def _handled_ids(self) -> set:
         """Jobs not worth opening again: applied, or skipped under the same facts file and resolver. A job inventoried as answerable
@@ -201,6 +224,7 @@ class Pass:
         if outcome in ("applied", "skipped_unanswerable", "skipped_job", "held_ai") or (outcome == "would_apply" and self.mode == "inventory"):
             self.handled.add(j["job_id"])
         if outcome == "applied":
+            self.applied_keys.add(_role_key(j.get("company"), j.get("title")))
             self.quota_left -= 1
             if self.mode == "live" and self.quota_left <= 0:
                 _R.switch_number = 0
@@ -289,6 +313,11 @@ def _render_card(card) -> None:
         time.sleep(0.2)
 
 
+def _role_key(company, title) -> str:
+    """A role as company + title, case and punctuation folded: LinkedIn reposts the same role under new job ids (Halian and Jobgether did on day one)."""
+    return re.sub(r"[^a-z0-9]+", " ", f"{company or ''} {title or ''}".lower()).strip()
+
+
 def _card_fields(card) -> tuple:
     """(title, company, "Location (Style)") read from a job card's own elements the way the bot's get_job_main_details does since the card
     layout changed: the company alone in the subtitle and the location in a separate caption (the older "Company · Location" subtitle is read
@@ -316,13 +345,19 @@ def _title_problem(title: str) -> str:
     any_words = tuple(getattr(S.cfg, "TITLE_ANY", ()) or ())
     if not any_words or not title:
         return ""
-    t = title.lower()
-    none_words = tuple(getattr(S.cfg, "TITLE_NONE", ()) or ())
-    if none_words and re.search(r"\b(" + "|".join(re.escape(w) for w in none_words) + r")\b", t):
+    # NFKC folds the mathematical-bold letters some recruiters use into plain ones; hyphens, slashes, dots and non-breaking spaces become spaces
+    t = re.sub(r"[\s\-_/. ]+", " ", unicodedata.normalize("NFKC", title).lower()).strip()
+
+    def has(words) -> bool:
+        return bool(words) and bool(re.search(r"\b(" + "|".join(re.escape(w) for w in words) + r")s?\b", t))
+
+    if has(tuple(getattr(S.cfg, "TITLE_NONE", ()) or ())):
         return f"title says this is not the user's kind of role: {title}"
-    if not re.search(r"\b(" + "|".join(re.escape(w) for w in any_words) + r")\b", t):
-        return f"title is not a data-engineering role: {title}"
-    return ""
+    if has(any_words) or any(re.search(p, t) for p in (getattr(S.cfg, "TITLE_PATTERNS", ()) or ())):
+        return ""
+    if has(tuple(getattr(S.cfg, "TITLE_TECH", ()) or ())) and has(tuple(getattr(S.cfg, "TITLE_ROLE", ()) or ())):
+        return ""
+    return f"title is not a data-engineering role: {title}"
 
 
 def _dump_card(card, job_id: str) -> None:
@@ -356,9 +391,15 @@ def _post_submit_evidence() -> None:
     """What LinkedIn shows right after the Submit click (its confirmation wording was never observed before the first live run): kept on the
     applied row and as a screenshot. Only reads; never raises."""
     try:
-        time.sleep(2.0)
-        modals = _R.driver.find_elements(By.CSS_SELECTOR, ".jobs-easy-apply-modal, .artdeco-modal")
-        S.job["post_submit"] = " ".join((modals[0].text or "").split())[:300] if modals else "(no modal on screen)"
+        text = ""
+        for _ in range(12):                          # up to ~6 s: LinkedIn shows a loading dialog first (the first real submit's fixed 2 s missed the real one)
+            time.sleep(0.5)
+            modals = _R.driver.find_elements(By.CSS_SELECTOR, ".jobs-easy-apply-modal, .artdeco-modal")
+            text = " ".join((modals[0].text or "").split())[:300] if modals else ""
+            if "application sent" in text.lower():
+                break
+        S.job["post_submit"] = text or "(no modal on screen)"
+        S.job["post_submit_sent"] = "application sent" in text.lower()      # LinkedIn's own confirmation: a second signal for the verification
         S.screenshot("post-submit")
     except Exception:
         pass
@@ -373,6 +414,8 @@ def _verify_after_submit(job: dict, applied_ts: str) -> None:
     try:
         for _ in range(5):
             how = _applied_marker(job["job_id"])
+            if not how and job.get("post_submit_sent"):
+                how = "LinkedIn's own dialog said the application was sent"
             if how:
                 break
             time.sleep(3.0)
@@ -748,13 +791,18 @@ def _patches(R) -> dict:
                 _note(f"uae: {why} reached")
             return (card_id or "unknown", "Unknown", "Unknown", "", "", True)
         _render_card(job)                            # before any decision: the list only renders what is near the viewport
+        S.cards_seen += 1
         if card_id and (card_id in S.handled or card_id in S.seen):
             return (card_id, "Unknown", "Unknown", "", "", True)
         # The card shows its own location: a job outside the UAE is rejected here, before the bot clicks it and waits its per-job pacing
         # (the first real pass spent 24 minutes of its 45 on 48 cards it then rejected one by one).
         title0, company0, loc0 = _card_fields(job)
         if card_id and not (title0 or company0 or loc0):
+            time.sleep(0.3)                          # a card that went stale between the scroll and the read looks just like a placeholder: once more
+            title0, company0, loc0 = _card_fields(job)
+        if card_id and not (title0 or company0 or loc0):
             # still an empty placeholder after scrolling to it: nothing to decide on, and the bot's own path would only wait its pacing and fail
+            S.placeholders += 1
             return (card_id, "Unknown", "Unknown", "", "", True)
         if card_id and loc0 and not any(w in loc0.lower() for w in S.cfg.UAE_LOCATION_WORDS):
             S.begin(card_id, title0, company0, loc0, "", count=False)
@@ -763,11 +811,18 @@ def _patches(R) -> dict:
             if S.loc_skips <= 2:
                 _dump_card(job, card_id)             # evidence of what a rejected card looks like, in case this gate is ever wrong
             return (card_id, title0 or "Unknown", company0 or "Unknown", loc0, "", True)
+        if card_id and loc0:
+            S.uae_cards += 1                         # a card whose own location is in the UAE (the "layout changed" warning needs at least one)
         why_title = _title_problem(title0)
         if card_id and why_title:                    # decided from the card too: no click, no per-job wait
             S.begin(card_id, title0, company0, loc0, "", count=False)
             S.finish("skipped_job", why_title)
             return (card_id, title0, company0 or "Unknown", loc0, "", True)
+        if card_id and title0 and company0 and _role_key(company0, title0) in S.applied_keys:
+            # the same role at the same company under another job id (reposts): applying twice looks careless
+            S.begin(card_id, title0, company0, loc0, "", count=False)
+            S.finish("skipped_job", "the same role at the same company was already applied to under another job id")
+            return (card_id, title0, company0, loc0, "", True)
         res = orig["get_job_main_details"](job, blacklisted_companies, rejected_jobs)
         job_id, title, company, location, style, skip = res
         if skip:
@@ -781,6 +836,12 @@ def _patches(R) -> dict:
             S.begin(job_id, title, company, location, style, count=False)
             S.finish("skipped_job", why_title)
             return (job_id, title, company, location, style, True)
+        if title and company and _role_key(company, title) in S.applied_keys:
+            S.begin(job_id, title, company, location, style, count=False)
+            S.finish("skipped_job", "the same role at the same company was already applied to under another job id")
+            return (job_id, title, company, location, style, True)
+        if not location and loc0:                    # the card went stale during the bot's own parse: the early read of its location stands
+            location = re.sub(r"\s*\((on-site|hybrid|remote)\)\s*$", "", loc0, flags=re.I)
         low = (location or "").lower()
         if not any(w in low for w in S.cfg.UAE_LOCATION_WORDS):
             R.print_lg(f'UAE pass: "{title} | {company}" is in "{location}", not the UAE. Skipping.')
@@ -1026,8 +1087,11 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
             setattr(R, n, v)
         if mode == "live":
             R.easy_applied_count += S.counts["applied"]            # R counts a failed Submit as applied; only real ones count here
-        if S.visits or sum(S.counts.values()):      # a pass that stopped at LinkedIn's limit banner did nothing: it must not start the min-gap clock
+        # a pass that looked at no card at all (it stopped at LinkedIn's limit banner) did nothing: it must not start the min-gap clock; one that only met
+        # handled or rejected cards did run, and without a cycle row it would run again every cycle, burning minutes the India pass needs
+        if S.visits or sum(S.counts.values()) or S.cards_seen:
             _jsonl(CYCLES_LOG, {"start": start.isoformat(timespec="seconds"), "end": datetime.now().isoformat(timespec="seconds"), "region": "UAE",
+                                "cards": S.cards_seen, "placeholders": S.placeholders,
                                 "mode": mode, "applied": S.counts["applied"], "verified": S.counts["verified"],
                                 "verify_failed": S.counts["verify_failed"], "would_apply": S.counts["would_apply"],
                                 "held_ai": S.counts["held_ai"],
@@ -1035,17 +1099,19 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
                                 "no_easy_apply": S.counts["no_easy_apply"], "failed": S.counts["failed"], "visits": S.visits,
                                 "facts_rev": facts.rev})
         _write_shortlist()
-        if S.visits == 0 and S.counts["skipped_job"] >= 10:
-            # exactly what a changed card layout looks like (the first real pass: 48 cards, every one "not in the UAE", none opened)
-            _note(f"uae: WARNING: {S.counts['skipped_job']} cards were rejected as outside the UAE and none was opened; if that is not the "
-                  "search's real result, the card layout has changed again (HTML of the first rejected cards is in logs\\uae-evidence)")
-        _note(f"uae: {mode} pass ended: {dict(S.counts)} over {S.visits} jobs")
+        if S.visits == 0 and S.cards_seen >= 10 and S.uae_cards == 0:
+            # exactly what a changed card layout looks like (the first real pass: 48 cards, every one "not in the UAE", none opened). A normal day with
+            # an exhausted UAE pool still shows UAE cards (handled or filtered), only padding from India shows none at all.
+            _note(f"uae: WARNING: {S.cards_seen} cards were looked at and none had a UAE location; if that is not the search's real result, the "
+                  "card layout has changed again (HTML of the first rejected cards is in logs\\uae-evidence)")
+        _note(f"uae: {mode} pass ended: {dict(S.counts)} over {S.visits} jobs ({S.cards_seen} cards looked at, {S.placeholders} empty placeholders)")
 
 
 def install(R, note) -> None:
     """Called by run_linkedin_local.py just before R.main(). Cheap and inert when the arming file is absent."""
-    global _R, _note
+    global _R, _note, _CODE_BASE
     _R, _note = R, note
+    _CODE_BASE = _code_base()                       # the code this process runs, fixed now (see _code_rev)
     orig_apply = R.apply_to_jobs
 
     def regional_apply(search_terms):
