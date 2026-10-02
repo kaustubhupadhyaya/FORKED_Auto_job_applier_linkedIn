@@ -269,6 +269,24 @@ def _dump_dom(job_id: str) -> None:
         pass
 
 
+def _render_card(card) -> None:
+    """LinkedIn renders a result card only while it is near the viewport (the others are empty placeholders), and the bot scrolls each card into view as
+    it works through the list. An early reject that never touches the next card leaves the cards after it empty: each then cost the runner's 8-20 s
+    pacing wait and a failed lookup (the first live pass spent its first minutes that way). So every card is scrolled to, and given up to ~2 s to show
+    its content, before anything is decided from it. Never raises."""
+    try:
+        _R.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
+    except Exception:
+        return
+    for _ in range(10):
+        try:
+            if card.find_elements(By.TAG_NAME, "a"):
+                return
+        except Exception:
+            return
+        time.sleep(0.2)
+
+
 def _card_fields(card) -> tuple:
     """(title, company, "Location (Style)") read from a job card's own elements the way the bot's get_job_main_details does since the card
     layout changed: the company alone in the subtitle and the location in a separate caption (the older "Company · Location" subtitle is read
@@ -727,11 +745,15 @@ def _patches(R) -> dict:
                 R.switch_number = 0
                 _note(f"uae: {why} reached")
             return (card_id or "unknown", "Unknown", "Unknown", "", "", True)
+        _render_card(job)                            # before any decision: the list only renders what is near the viewport
         if card_id and (card_id in S.handled or card_id in S.seen):
             return (card_id, "Unknown", "Unknown", "", "", True)
         # The card shows its own location: a job outside the UAE is rejected here, before the bot clicks it and waits its per-job pacing
         # (the first real pass spent 24 minutes of its 45 on 48 cards it then rejected one by one).
         title0, company0, loc0 = _card_fields(job)
+        if card_id and not (title0 or company0 or loc0):
+            # still an empty placeholder after scrolling to it: nothing to decide on, and the bot's own path would only wait its pacing and fail
+            return (card_id, "Unknown", "Unknown", "", "", True)
         if card_id and loc0 and not any(w in loc0.lower() for w in S.cfg.UAE_LOCATION_WORDS):
             S.begin(card_id, title0, company0, loc0, "", count=False)
             S.finish("skipped_job", f"location is not in the UAE: {loc0}")
