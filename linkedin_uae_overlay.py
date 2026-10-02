@@ -290,6 +290,21 @@ def _card_fields(card) -> tuple:
     return title, company.split("\n")[0].strip(), loc.strip()
 
 
+def _title_problem(title: str) -> str:
+    """Why this job title is not one the pass opens ("" when it is): it must name a data-engineering role (config TITLE_ANY) and none of the words
+    that rule a job out (TITLE_NONE). A config without TITLE_ANY applies no title gate."""
+    any_words = tuple(getattr(S.cfg, "TITLE_ANY", ()) or ())
+    if not any_words or not title:
+        return ""
+    t = title.lower()
+    none_words = tuple(getattr(S.cfg, "TITLE_NONE", ()) or ())
+    if none_words and re.search(r"\b(" + "|".join(re.escape(w) for w in none_words) + r")\b", t):
+        return f"title says this is not the user's kind of role: {title}"
+    if not re.search(r"\b(" + "|".join(re.escape(w) for w in any_words) + r")\b", t):
+        return f"title is not a data-engineering role: {title}"
+    return ""
+
+
 def _dump_card(card, job_id: str) -> None:
     """The real HTML of a card the pass rejected by location (the first two of a pass). Only reads; never raises."""
     try:
@@ -724,6 +739,11 @@ def _patches(R) -> dict:
             if S.loc_skips <= 2:
                 _dump_card(job, card_id)             # evidence of what a rejected card looks like, in case this gate is ever wrong
             return (card_id, title0 or "Unknown", company0 or "Unknown", loc0, "", True)
+        why_title = _title_problem(title0)
+        if card_id and why_title:                    # decided from the card too: no click, no per-job wait
+            S.begin(card_id, title0, company0, loc0, "", count=False)
+            S.finish("skipped_job", why_title)
+            return (card_id, title0, company0 or "Unknown", loc0, "", True)
         res = orig["get_job_main_details"](job, blacklisted_companies, rejected_jobs)
         job_id, title, company, location, style, skip = res
         if skip:
@@ -731,6 +751,11 @@ def _patches(R) -> dict:
             return res
         if str(job_id) in S.handled or str(job_id) in S.seen:
             R.print_lg(f'UAE pass: "{title} | {company}" was already handled. Skipping.')
+            return (job_id, title, company, location, style, True)
+        why_title = _title_problem(title)            # the bot's own parse, when the card's elements gave nothing to decide on
+        if why_title:
+            S.begin(job_id, title, company, location, style, count=False)
+            S.finish("skipped_job", why_title)
             return (job_id, title, company, location, style, True)
         low = (location or "").lower()
         if not any(w in low for w in S.cfg.UAE_LOCATION_WORDS):
