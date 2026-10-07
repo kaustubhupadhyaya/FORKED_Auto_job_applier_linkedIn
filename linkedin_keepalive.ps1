@@ -66,7 +66,14 @@ $SupervisorLogPath = Join-Path $LogsDir "supervisor.log"
 $GateMarkerPath    = Join-Path $LogsDir "GATE_STOPPED"
 $SupervisorLock    = Join-Path $LogsDir "supervisor.lock"
 $HistoryCsvPath    = Join-Path $RepoDir "all excels\all_applied_applications_history.csv"
-$LimitRetryHours   = 2     # a limit carried over from yesterday (0 saved today) is retried this often
+$ResetMarginMin    = 5     # start this many minutes after LinkedIn's daily reset (00:00 UTC = 05:30 IST)
+
+# LinkedIn's Easy Apply quota resets at 00:00 UTC, not at local midnight: measured 2026-10-01..10-08, every
+# launch between 00:00 and 05:30 IST was refused and every first success of a day came after 05:30 IST.
+function Get-NextLinkedInReset {
+    $utcNow = (Get-Date).ToUniversalTime()
+    return $utcNow.Date.AddDays(1).ToLocalTime().AddMinutes($ResetMarginMin)
+}
 
 # ---------------------------------------------------------------- Logging
 function Write-KeepaliveLog {
@@ -341,57 +348,40 @@ function Invoke-KeepalivePass {
         return
     }
 
-    # 5. Process is DEAD - Check Daily Limit Flag
-    # If today's daily limit has been reached, sleep peacefully until tomorrow (or exit on SinglePass)
-    if ($limitReached -and $todayCount -eq 0 -and -not $SinglePass) {
-        # LinkedIn's Easy Apply limit is not a local calendar day: after a big day (68 on 2026-09-30
-        # until 07:27) it refused again at 00:05 with nothing saved today, and resting until tomorrow
-        # lost the whole day (also on 2026-09-19). The limit is carried over, so retry every
-        # $LimitRetryHours h: set today's marker aside and relaunch; the bot writes a new marker if
-        # LinkedIn still refuses. (User's choice, 2026-10-01.)
-        $retryAt = $now.AddHours($LimitRetryHours)
-        $tomorrow = $now.Date.AddDays(1).AddMinutes(1)
-        if ($retryAt -lt $tomorrow) {
-            Write-KeepaliveLog "LinkedIn's limit came with nothing saved today (carried over from yesterday). Retrying at $($retryAt.ToString('HH:mm')) instead of resting until tomorrow." "WARN"
-            $state | Add-Member -NotePropertyName "LimitRetryAt" -NotePropertyValue $retryAt.ToString("s") -Force
-            $state.ConsecutiveCrashes = 0
-            Save-KeepaliveState $state
-            while ((Get-Date) -lt $retryAt) {
-                $chunk = [Math]::Min(300, [int]($retryAt - (Get-Date)).TotalSeconds)
-                if ($chunk -le 0) { break }
-                Start-Sleep -Seconds $chunk
-            }
-            $marker = Join-Path $LogsDir "LINKEDIN_DAILY_LIMIT_$todayStr"
-            if (Test-Path $marker) {
-                Move-Item -Path $marker -Destination "$marker.carryover-$((Get-Date).ToString('HHmm'))" -Force -ErrorAction SilentlyContinue
-            }
-            $state = Get-KeepaliveState
-            $state.LastLimitDate = $null
-            $state | Add-Member -NotePropertyName "LimitRetryAt" -NotePropertyValue $null -Force
-            Save-KeepaliveState $state
-            Write-KeepaliveLog "Retry time reached; set today's carried-over limit marker aside. Relaunching on the next pass." "INFO"
-            return
-        }
+    # 5. Process is DEAD - LinkedIn's daily limit
+    # 2026-10-08: the limit is LinkedIn's own, counted per UTC day (resets 05:30 IST). Resting until local
+    # midnight and then retrying every 2 h (the 10-01 design, made before the reset time was known) wasted
+    # 3 refused launches a night, ran the UAE pass only when the quota was already gone, and made the
+    # dashboard show "Failing". Now a limit, with or without saves today, rests until the next reset.
+    $restUntil = $null
+    try { if ($state.LimitRestUntil) { $restUntil = [datetime]$state.LimitRestUntil } } catch { $restUntil = $null }
+    if ($limitReached -and -not $restUntil) {
+        $restUntil = Get-NextLinkedInReset
+        $state | Add-Member -NotePropertyName "LimitRestUntil" -NotePropertyValue $restUntil.ToString("s") -Force
+        Write-KeepaliveLog "LinkedIn's Easy Apply limit is reached ($todayCount saved today). LinkedIn resets it at 00:00 UTC; resting until $($restUntil.ToString('yyyy-MM-dd HH:mm'))." "OK"
     }
-    if ($limitReached) {
-        Write-KeepaliveLog "Daily application limit reached for today ($todayStr). LinkedIn auto-apply has completed its daily run ($todayCount applied). Resting until tomorrow." "OK"
+    if ($restUntil) {
         $state.LastLimitDate = $todayStr
         $state.ConsecutiveCrashes = 0
         Save-KeepaliveState $state
-
-        if (-not $SinglePass) {
-            $tomorrow = $now.Date.AddDays(1).AddMinutes(1)
-            $sleepSec = [int]($tomorrow - (Get-Date)).TotalSeconds
-            if ($sleepSec -gt 0) {
-                Write-KeepaliveLog "Continuous mode: sleeping peacefully for $([math]::Round($sleepSec/3600, 2)) hours until tomorrow ($($tomorrow.ToString('yyyy-MM-dd HH:mm:ss')))..." "INFO"
-                while ((Get-Date) -lt $tomorrow) {
-                    $rem = [int]($tomorrow - (Get-Date)).TotalSeconds
-                    $chunk = [Math]::Min(300, $rem)
-                    if ($chunk -le 0) { break }
-                    Start-Sleep -Seconds $chunk
-                }
+        if ($SinglePass) { return }
+        while ((Get-Date) -lt $restUntil) {
+            $chunk = [Math]::Min(300, [int]($restUntil - (Get-Date)).TotalSeconds)
+            if ($chunk -le 0) { break }
+            Start-Sleep -Seconds $chunk
+        }
+        # A new LinkedIn day: set the limit markers that caused the rest aside so it starts clean.
+        foreach ($d in @($todayStr, (Get-Date -Format "yyyy-MM-dd"))) {
+            $marker = Join-Path $LogsDir "LINKEDIN_DAILY_LIMIT_$d"
+            if (Test-Path $marker) {
+                Move-Item -Path $marker -Destination "$marker.rested-$((Get-Date).ToString('HHmm'))" -Force -ErrorAction SilentlyContinue
             }
         }
+        $state = Get-KeepaliveState
+        $state.LastLimitDate = $null
+        $state | Add-Member -NotePropertyName "LimitRestUntil" -NotePropertyValue $null -Force
+        Save-KeepaliveState $state
+        Write-KeepaliveLog "LinkedIn's daily reset has passed; relaunching on the next pass." "INFO"
         return
     }
 
