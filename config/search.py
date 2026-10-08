@@ -113,7 +113,9 @@ pause_after_filters = False         # True or False, Note: True or False are cas
 ## >>>>>>>>>>> SKIP IRRELEVANT JOBS <<<<<<<<<<<
  
 # Avoid applying to these companies, and companies with these bad words in their 'About Company' section...
-about_company_bad_words = ["Crossover"]       # (dynamic multiple search) or leave empty as []. Ex: ["Staffing", "Recruiting", "Name of Company you don't want to apply to"]
+# 2026-10-08: the user's Naukri avoid list applied here too (full names; "TCS" alone would match inside other words)
+about_company_bad_words = ["Crossover", "Tata Consultancy Services", "Wipro", "Infosys", "Client of IMC", "Han Digital",
+                           "Krazy Mantra", "Logic Planet", "Rarr Technologies", "Soul AI"]       # (dynamic multiple search) or leave empty as []. Ex: ["Staffing", "Recruiting", "Name of Company you don't want to apply to"]
 
 # Skip checking for `about_company_bad_words` for these companies if they have these good words in their 'About Company' section... [Exceptions, For example, I want to apply to "Robert Half" although it's a staffing company]
 about_company_good_words = []      # (dynamic multiple search) or leave empty as []. Ex: ["Robert Half", "Dice"]
