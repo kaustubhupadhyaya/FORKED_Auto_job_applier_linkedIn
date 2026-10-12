@@ -412,6 +412,64 @@ def check_blacklist(rejected_jobs: set, job_id: str, company: str, blacklisted_c
     return rejected_jobs, blacklisted_companies, jobs_top_card
 
 
+# 2026-10-13, user decision (mandatory filter): apply only to jobs whose details pane says "Actively reviewing applicants".
+# The status is the second line of the top card's description ("Promoted by hirer · Actively reviewing applicants"). In 400 of the bot's own
+# page captures it read one of: "... · Actively reviewing applicants" (181), "... · No response insights available yet" (211), or "... · Company
+# review time is typically N week(s)" (8). The pane's title link carries the job's id (300 of 300 captures), so the status is only trusted once the
+# pane belongs to the job that was clicked: LinkedIn keeps showing the previous job for a moment after a click.
+import time as _time
+import json as _json
+
+ACTIVE_REVIEW_PHRASE = "actively reviewing applicants"
+_PANE_STATUS_JS = r"""
+const link = document.querySelector('[class*="job-details-jobs-unified-top-card__job-title"] a[href*="/jobs/view/"]')
+          || document.querySelector('.job-details-jobs-unified-top-card a[href*="/jobs/view/"]');
+const top = document.querySelector('.job-details-jobs-unified-top-card__primary-description-container')
+         || document.querySelector('.job-details-jobs-unified-top-card__tertiary-description-container');
+const lines = top ? [...top.querySelectorAll('p')].map(x => x.innerText.trim()).filter(Boolean) : [];
+return {href: link ? link.getAttribute('href') : null, text: top ? top.innerText : null, status: lines.join(' | ')};
+"""
+
+
+def read_applicant_status(job_id: str, wait_s: float = 7.0) -> tuple[bool | None, str]:
+    """What LinkedIn prints under the open job's location. Returns (True, status) when it says "Actively reviewing applicants", (False, status)
+    when the pane (confirmed to be this job) shows any other status, and (None, why) when the pane could not be read for this job within wait_s
+    (it still shows another job, or has no status line). The filter is mandatory, so None skips the job as well, but it is logged as unreadable
+    and never as a rejection of the job."""
+    deadline = _time.time() + wait_s
+    why = "no job pane on the page"
+    while True:
+        try:
+            r = driver.execute_script(_PANE_STATUS_JS) or {}
+        except Exception as e:
+            r, why = {}, f"could not read the pane ({type(e).__name__})"
+        if r:
+            href = r.get("href") or ""
+            if str(job_id) not in href:
+                why = f"the pane shows another job ({href[:50] or 'no title link'})"
+            else:
+                text = " ".join(str(r.get("text") or "").split())
+                status = " ".join(str(r.get("status") or "").split())
+                if ACTIVE_REVIEW_PHRASE in text.lower():
+                    return True, status or text
+                if status:
+                    return False, status
+                why = "the pane is this job's but shows no status line"
+        if _time.time() >= deadline:
+            return None, why
+        _time.sleep(0.4)
+
+
+def log_filter_skip(job_id: str, title: str, company: str, location: str, reason: str, seen: str) -> None:
+    """One line per job the mandatory filter skipped, for the dashboard and for telling a real rejection from a broken selector."""
+    try:
+        with open(os.path.join(logs_folder_path, "linkedin_filter_skips.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "job_id": job_id, "title": title,
+                                  "company": company, "location": location, "reason": reason, "seen": seen}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 
 # Function to extract years of experience required from About Job
 def extract_years_of_experience(text: str) -> int:
@@ -1026,7 +1084,18 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         print_lg("Failed to scroll to About Company!")
                         # print_lg(e)
 
-
+                    # Mandatory filter (user decision 2026-10-13): only "Actively reviewing applicants" jobs. Runs in the UAE pass too: the overlay
+                    # runs this same loop, and its failed_job turns a "Skipped" record into its own skipped_job outcome.
+                    if require_actively_reviewing_applicants:
+                        is_active, status_seen = read_applicant_status(job_id)
+                        if is_active is not True:
+                            reason = "not actively reviewing applicants" if is_active is False else "applicant status unreadable"
+                            print_lg(f'Filter: skipping "{title} | {company}" ({reason}). LinkedIn shows: {status_seen}. Job ID: {job_id}!')
+                            log_filter_skip(job_id, title, company, work_location, reason, status_seen)
+                            failed_job(job_id, job_link, resume, date_listed, f"Filter: {reason}", status_seen, "Skipped", screenshot_name)
+                            if is_active is False: rejected_jobs.add(job_id)    # "unreadable" is a lag or a layout problem, not a verdict on the job
+                            skip_count += 1
+                            continue
 
                     # Hiring Manager info
                     try:

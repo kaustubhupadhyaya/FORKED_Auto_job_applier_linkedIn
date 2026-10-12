@@ -1249,6 +1249,12 @@ try:
     _orig_failed_job = R.failed_job
 
     def _evidenced_failed_job(job_id="", *args, **kwargs):
+        # 2026-10-13: a job skipped by the mandatory "Actively reviewing applicants" filter is not a failure. It gets neither the page dump
+        # (about 2.5 MB: screenshot + HTML + JSON, for more than half of all cards) nor a row in the failed-jobs list; runAiBot.py
+        # writes its own one-line record to logs/linkedin_filter_skips.jsonl.
+        _err = args[3] if len(args) > 3 else kwargs.get("error", "")
+        if str(_err).startswith("Filter:"):
+            return None
         try:
             _job_evidence("failed", job_id)
         except Exception:

@@ -111,7 +111,13 @@ pause_after_filters = False         # True or False, Note: True or False are cas
 
 
 ## >>>>>>>>>>> SKIP IRRELEVANT JOBS <<<<<<<<<<<
- 
+
+# MANDATORY (user decision, 2026-10-13): apply only to jobs whose details pane says "Actively reviewing applicants" (the green line under the
+# location, e.g. "Promoted by hirer · Actively reviewing applicants"). A job showing any other status ("No response insights available yet",
+# "Company review time is typically 1 week"...) is skipped, and so is a job whose pane could not be read. Applies to the India and UAE passes.
+# Every skip is one line in logs/linkedin_filter_skips.jsonl with the status LinkedIn showed.
+require_actively_reviewing_applicants = True
+
 # Avoid applying to these companies, and companies with these bad words in their 'About Company' section...
 # 2026-10-08: the user's Naukri avoid list applied here too (full names; "TCS" alone would match inside other words)
 about_company_bad_words = ["Crossover", "Tata Consultancy Services", "Wipro", "Infosys", "Client of IMC", "Han Digital",
