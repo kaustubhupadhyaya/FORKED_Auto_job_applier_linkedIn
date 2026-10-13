@@ -9,8 +9,11 @@ What it does beyond `python runAiBot.py`:
      NEVER pyautogui.alert (the "Failed Logging" modal blocked the whole bot).
    - global pyautogui.alert/confirm neutralised to log-and-continue.
    - manual_login_retry: timed wait (180s) instead of infinite modal loop.
-   - per-job session watchdog in get_job_main_details: re-login on logout,
-     long supervised pause only on checkpoint/challenge/captcha.
+   - per-job session watchdog in get_job_main_details: re-login on logout.
+   - LinkedIn security pages (checkpoint challenge, captcha, add-phone, account
+     restriction), at sign-in or mid-run: evidence + logs/LINKEDIN_WALL_<date>,
+     then exit 48 (L2). Sign-in pages are not walls: a lapsed session signs in
+     from the vault, at most once per process; otherwise exit 45.
    - safe answers: explicit email/phone/country-code/city mappings; random
      select fallback (select_by_index) converted to discard instead of guess.
    - wait_span_click retry for Submit/Review/Done/Next/Discard.
@@ -238,15 +241,239 @@ for _modname in ("modules.ai.openaiConnections", "modules.ai.deepseekConnections
     except Exception:
         pass
 
+# --- 1b. Verification-wall stop (L2, 2026-10-13; review changes 2026-10-14) ---------
+# A LinkedIn security page (a checkpoint challenge, captcha, add-phone or account-restriction page, or a shown captcha or
+# HUMAN challenge frame), at sign-in or mid-run, ends the run at once: a screenshot and the URL path go to logs/wall-evidence,
+# the day's marker logs/LINKEDIN_WALL_<date> is written, and the process exits 48. run_linkedin_supervised.py then writes
+# NEEDS_HUMAN and does not restart; linkedin_keepalive.ps1 raises the toast and holds after a second wall day in a row. Before
+# this, a wall got a 10-minute wait and the run carried on. A wall is never waited out and never continued past (the user's
+# rule: never evade bot detection; stop and report). LinkedIn's sign-in pages (/login, /checkpoint/lg/..., /uas/login,
+# password reset, /authwall) are not walls: a lapsed session signs in again from the vault (the user's decision, Q3), at most
+# once per process (section 3: exit 45 otherwise).
+from urllib.parse import quote as _quote, urlsplit as _urlsplit  # noqa: E402
+
+_WALL_EXIT = 48
+_WALL_DIR = os.path.join(REPO, "logs", "wall-evidence")
+# where: "login" until the first job search starts, then "midrun". stopped: the wall's kind once a wall has stopped the run.
+_WALL_STATE = {"where": "login", "stopped": None}
+# URL path signals. Only the path is read, never the query string, and only under LinkedIn's security roots (or a path ending
+# in /login-restriction): a job or company slug such as /jobs/view/challenge-lead-at-x-123/ or /company/2captcha/ never counts.
+_WALL_PATH_ROOTS = ("/checkpoint/", "/check/", "/uas/")
+_WALL_PATH_WORDS = (("captcha", "captcha"), ("challenge", "challenge"), ("add-phone", "add-phone"), ("restrict", "restricted"))
+# The page's own wording (title and visible text), first match wins. It is read only off the bot's working pages
+# (_WALL_WORK_PATHS, which include the Easy Apply modal) and only when LinkedIn's signed-in navigation bar is absent: job ads
+# mention "security checks" (eleven of them in logs/log.txt) and feed posts are other members' words. A wall on the working
+# pages arrives as a redirect (the URL signals) or a shown frame, and both are checked everywhere.
+_WALL_TEXT = {
+    "we've restricted your account": "restricted",
+    "we've temporarily restricted your account": "restricted",
+    "your account has been restricted": "restricted",
+    "your account has been temporarily restricted": "restricted",
+    "your account is temporarily restricted": "restricted",
+    "verify your identity": "verify-identity",
+    "let's do a quick security check": "security-check",
+    "quick security check": "security-check",
+    "security verification": "security-check",
+}
+_WALL_WORK_PATHS = ("/feed", "/jobs", "/my-items")
+# Challenge frames (reCAPTCHA, hCaptcha, Arkose/FunCaptcha, HUMAN/PerimeterX) count only when really shown: overlapping the
+# viewport, larger than 50x50, and no ancestor hidden or transparent. Every normal job page carries a hidden reCAPTCHA
+# Enterprise frame (size=invisible, inside a display:none badge) and HUMAN / fingerprint sensor frames that are 0x0 or
+# visibility:hidden and parked off-screen (seen in the logs/job-evidence page captures).
+_WALL_JS = r"""
+const phrases = arguments[0];
+// Shown: overlaps the viewport on all four edges, larger than 50x50, and neither the frame nor any ancestor is
+// display:none, visibility hidden/collapse or (nearly) transparent.
+const shown = e => {
+  const r = e.getBoundingClientRect();
+  if (!(r.width > 50 && r.height > 50 && r.left < innerWidth && r.top < innerHeight && r.right > 0 && r.bottom > 0)) return false;
+  for (let n = e; n; n = n.parentElement) {
+    const s = getComputedStyle(n);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse' || parseFloat(s.opacity) < 0.1) return false;
+  }
+  return true;
+};
+let frame = null;
+for (const f of document.querySelectorAll('iframe')) {
+  const a = [f.getAttribute('src'), f.getAttribute('title'), f.id, f.getAttribute('name')].join(' ').toLowerCase();
+  if (!/captcha|arkose|protechts|perimeterx|humanthirdparty|security verification/.test(a) || a.includes('size=invisible')
+      || !shown(f)) continue;
+  frame = /protechts|perimeterx|humanthirdparty/.test(a) ? 'human' : a.includes('hcaptcha') ? 'hcaptcha'
+        : /arkose|funcaptcha/.test(a) ? 'arkose' : a.includes('recaptcha') ? 'recaptcha'
+        : a.includes('security verification') ? 'human' : 'captcha';
+  break;
+}
+let phrase = null;
+if (phrases.length && !document.querySelector('#global-nav, header.global-nav')) {
+  // U+2018 / U+2019 typographic apostrophes become ' (LinkedIn writes "Let's" with U+2019)
+  const text = (document.title + ' | ' + (document.body ? document.body.innerText : ''))
+                 .replace(/[‘’]/g, "'").replace(/\s+/g, ' ').toLowerCase();
+  phrase = phrases.find(p => text.includes(p)) || null;
+}
+return [frame, phrase];
+"""
+
+
+def _linkedin_path(url):
+    """The lower-case path of a LinkedIn URL; None for any other URL (about:blank, a Chrome error page, an employer's site in
+    an external-apply tab): walls are looked for on LinkedIn's own pages only."""
+    parts = _urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    if host != "linkedin.com" and not host.endswith(".linkedin.com"):
+        return None
+    return (parts.path or "/").lower()
+
+
+def _wall_path_kind(path):
+    """"url:<kind>" when a LinkedIn path is a security page (/checkpoint/challenge/..., /uas/consumer-email-challenge,
+    /check/add-phone, .../login-restriction), else None. Sign-in pages under the same roots carry none of the words."""
+    if path.startswith(_WALL_PATH_ROOTS) or path.rstrip("/").endswith("/login-restriction"):
+        for needle, kind in _WALL_PATH_WORDS:
+            if needle in path:
+                return "url:" + kind
+    return None
+
+
+def _wall_kind(driver):
+    """Short kind ("url:challenge", "captcha:arkose", "captcha:human", "text:restricted", ...) when the current page is a
+    LinkedIn security wall, else None. Read-only: the URL path, shown challenge frames and the page's own wording. Never
+    clicks, never waits."""
+    try:
+        path = _linkedin_path(driver.current_url)
+    except Exception:
+        return None
+    if path is None:
+        return None
+    kind = _wall_path_kind(path)
+    if kind:
+        return kind
+    phrases = [] if path.startswith(_WALL_WORK_PATHS) else list(_WALL_TEXT)
+    try:
+        frame, phrase = driver.execute_script(_WALL_JS, phrases) or (None, None)
+    except Exception:
+        return None
+    if frame:
+        return "captcha:" + str(frame)
+    if phrase:
+        return "text:" + _WALL_TEXT.get(phrase, "wall")
+    return None
+
+
+def _wall_url_path(driver):
+    """The page's URL path for the evidence: no query string; e-mail addresses and the account's username masked."""
+    import re
+    try:
+        path = _urlsplit(driver.current_url or "").path or "/"
+    except Exception:
+        return "?"
+    path = re.sub(r"[^/]*(?:@|%40)[^/]*", "<email>", path)
+    user = str(getattr(R, "username", "") or "").strip()
+    if user:
+        for form in {user, _quote(user, safe="")}:
+            path = re.sub(re.escape(form), "<user>", path, flags=re.IGNORECASE)
+    return path
+
+
+def _wall_stop(driver, kind):
+    """Record the wall (screenshot and URL path, the day's marker) and end the process with exit 48. Never returns."""
+    import json
+    where = _WALL_STATE["where"]
+    now = datetime.now()
+    base = os.path.join(_WALL_DIR, f"wall-{now:%Y%m%d_%H%M%S}-{where}")
+    record = {"since": now.isoformat(timespec="seconds"), "kind": kind, "where": where, "url_path": _wall_url_path(driver),
+              "evidence": base + ".png"}
+    try:
+        os.makedirs(_WALL_DIR, exist_ok=True)
+        try:
+            driver.save_screenshot(base + ".png")
+        except Exception as e:
+            _note(f"wall screenshot failed: {e!r}")
+        with open(base + ".json", "w", encoding="utf-8") as fh:
+            json.dump(record, fh, indent=2)
+    except Exception as e:
+        _note(f"wall evidence not saved: {e!r}")
+    marker = os.path.join(REPO, "logs", f"LINKEDIN_WALL_{now:%Y-%m-%d}")
+    try:
+        if not os.path.exists(marker):      # one marker a day: "since" stays the day's first wall
+            with open(marker + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+            os.replace(marker + ".tmp", marker)
+    except Exception as e:
+        _note(f"wall marker not written: {e!r}")
+    _WALL_STATE["stopped"] = kind
+    msg = (f"WALL STOP: LinkedIn verification wall ({kind}) {'at sign-in' if where == 'login' else 'mid-run'}, "
+           f"path {record['url_path']}. Not waiting, not continuing: exit {_WALL_EXIT}. Evidence: {base}.png")
+    try:
+        R.print_lg(msg)
+    except Exception:
+        pass
+    _note(msg)
+    raise SystemExit(_WALL_EXIT)
+
+
+def _check_wall():
+    """L2 check point: stop the run (exit 48) when the current page is a verification wall; return only when it is not.
+    Called only where nothing between it and runAiBot.main() catches SystemExit (main itself lets it through)."""
+    if _WALL_STATE["stopped"]:
+        raise SystemExit(_WALL_EXIT)    # an inner handler swallowed the first stop: stop again (no second marker)
+    try:
+        d = R.driver
+    except Exception:
+        return
+    kind = _wall_kind(d)
+    if kind:
+        _wall_stop(d, kind)
+
+
+# Check points without a per-job hook. main() calls run() right after its sign-in step: a wall there can pass for a signed-in
+# page, because is_logged_in_LN assumes "logged in" when it finds no Sign-in link. apply_to_jobs() calls apply_filters()
+# right after loading each search page, and get_page_info() once per results page (inside a try that lets SystemExit
+# through), which also covers the cards the UAE overlay rejects without opening them. The other check points:
+# _patched_login_LN, the per-job watchdog and the official-count tab (and _timed_login_retry, which only runAiBot's own
+# login_LN calls, and that is replaced below).
+_orig_run = R.run
+
+
+def _wall_checked_run(total_runs):
+    _check_wall()
+    _WALL_STATE["where"] = "midrun"
+    return _orig_run(total_runs)
+
+
+R.run = _wall_checked_run
+
+_orig_apply_filters = R.apply_filters
+
+
+def _wall_checked_apply_filters(*args, **kwargs):
+    _check_wall()
+    return _orig_apply_filters(*args, **kwargs)
+
+
+R.apply_filters = _wall_checked_apply_filters
+
+_orig_get_page_info = R.get_page_info
+
+
+def _wall_checked_get_page_info(*args, **kwargs):
+    _check_wall()
+    return _orig_get_page_info(*args, **kwargs)
+
+
+R.get_page_info = _wall_checked_get_page_info
+
 # --- 2. Non-blocking login retry -------------------------------------------------
 def _timed_login_retry(is_logged_in, limit=2, timeout_s=180):
+    # L2: every poll checks for a verification wall first, so this wait never waits one out (exit 48 instead).
     waited = 0
+    _check_wall()
     while not is_logged_in() and waited < timeout_s:
         if waited == 0:
             _resilient_print_lg("Not logged in yet — waiting up to "
                                 f"{timeout_s}s (no popup in unattended mode).")
         time.sleep(5)
         waited += 5
+        _check_wall()
     try:
         return bool(is_logged_in())
     except Exception:
@@ -301,11 +528,33 @@ def _fill(driver, el, value):
     time.sleep(0.2)
 
 
+# S10 (2026-10-14): at most ONE credential (vault) sign-in per process. A lapsed session signs in again once and the run
+# continues; needing a second sign-in, or a sign-in that leaves the session signed out, ends the run with exit 45 (signed
+# out / sign-in failed). That is not a wall: no marker, no hold. run_linkedin_supervised.py writes NEEDS_HUMAN and does not
+# restart today.
+_SIGNIN_EXIT = 45
+_SIGNIN = {"used": 0}
+
+
+def _signin_stop(why):
+    msg = f"SIGN-IN STOP: {why}. Exit {_SIGNIN_EXIT}: YOUR TURN, sign in in the linkedin-1 profile."
+    try:
+        R.print_lg(msg)
+    except Exception:
+        pass
+    _note(msg)
+    raise SystemExit(_SIGNIN_EXIT)
+
+
 def _patched_login_LN():
     d = R.driver
     d.get("https://www.linkedin.com/login")
+    _check_wall()       # L2: a wall instead of the sign-in page ends the run before anything is typed
     if R.is_logged_in_LN():
         return R.print_lg("Already logged in via persistent session, skipping credential login!")
+    if _SIGNIN["used"]:
+        _signin_stop("the session lapsed again after this run's one vault sign-in")
+    _SIGNIN["used"] += 1
     wait = WebDriverWait(d, 25)
     try:
         wait.until(lambda drv: _real_input(
@@ -338,22 +587,19 @@ def _patched_login_LN():
 
     for _ in range(40):
         time.sleep(1)
+        # L2: a checkpoint / challenge / captcha / add-phone page after sign-in ends the run (exit 48). It used to get a
+        # 10-minute wait for a manual solve, after which the run carried on.
+        _check_wall()
         try:
             url = d.current_url
         except Exception:
             url = ""
         if "/feed" in url:
             return R.print_lg("Login successful!")
-        if "/checkpoint/" in url or "/challenge/" in url or "/add-phone" in url:
-            R.print_lg("LinkedIn wants a verification step — waiting 10 min for "
-                       "manual solve (no popup in unattended mode).")
-            _timed_login_retry(R.is_logged_in_LN, 2, timeout_s=600)
-            return
     if R.is_logged_in_LN():
         return R.print_lg("Login successful!")
-    R.print_lg("Auto-login did not complete — waiting 3 min for manual login, "
-               "then continuing.")
-    _timed_login_retry(R.is_logged_in_LN, 2, timeout_s=180)
+    # S10: still signed out after the 40 s loop. It used to wait 3 minutes for a manual sign-in and then carry on.
+    _signin_stop("still signed out 40 s after the vault sign-in")
 
 
 R.login_LN = _patched_login_LN
@@ -684,10 +930,14 @@ def _reconcile_ln_periodic(force=False):
         d.switch_to.new_window("tab")
         try:
             d.get(_REC_URL)
+            # L2: this tab's full page load is a mid-run check point too (the finally closes the tab). Checked right after
+            # the load (a redirect to a wall) and again after the ready-wait (a wall the page draws itself).
+            _check_wall()
             try:
                 WebDriverWait(d, 25).until(_rec_ready)
             except Exception as e:
                 _note(f"jobs-tracker wait timed out, parsing anyway: {e!r}")
+            _check_wall()
             try:
                 _tc = _tracker_linkedin_count()
             except Exception:
@@ -719,16 +969,9 @@ _orig_get_job_main_details = R.get_job_main_details
 
 def _watched_get_job_main_details(job, blacklisted_companies, rejected_jobs):
     try:
-        try:
-            url = R.driver.current_url
-        except Exception:
-            url = ""
-        low = (url or "").lower()
-        if "checkpoint" in low or "challenge" in low or "captcha" in low or "add-phone" in low:
-            R.print_lg(f"Verification wall mid-run ({url}) — supervised pause 10 min, "
-                       "job skipped meanwhile.")
-            _timed_login_retry(R.is_logged_in_LN, 2, timeout_s=600)
-            return ("unknown", "Unknown", "Unknown", "", "", True)
+        # L2: a verification wall mid-run ends the run (exit 48; SystemExit passes the except below). It used to get a
+        # 10-minute pause, after which the run carried on.
+        _check_wall()
         if not R.is_logged_in_LN():
             R.print_lg("Session looks logged out mid-run — re-logging in.")
             try:
@@ -1296,4 +1539,21 @@ except Exception as _e:
     _note(f"UAE overlay not installed: {_e!r}")
 
 _note(f"hardened runner ready (user={R.username!r} from {_src}).")
-R.main()
+# L2 backstop: once a wall has stopped the run, the process ends with 48 whatever happened inside the bot. An exception raised
+# in a finally block on the way out (the Easy Apply flow has one) can replace the SystemExit, or another exit code can win.
+# Without a wall, every exit and exception passes through unchanged.
+try:
+    R.main()
+except SystemExit as _exit:
+    if _WALL_STATE["stopped"] and _exit.code != _WALL_EXIT:
+        _note(f"wall stop ({_WALL_STATE['stopped']}) ends this run: exit {_WALL_EXIT}, not {_exit.code}.")
+        sys.exit(_WALL_EXIT)
+    raise
+except BaseException as _exc:
+    if _WALL_STATE["stopped"]:
+        _note(f"wall stop ({_WALL_STATE['stopped']}) ends this run: exit {_WALL_EXIT}, not {type(_exc).__name__}.")
+        sys.exit(_WALL_EXIT)
+    raise
+if _WALL_STATE["stopped"]:
+    _note(f"wall stop ({_WALL_STATE['stopped']}) was swallowed inside the bot; exiting {_WALL_EXIT}.")
+    sys.exit(_WALL_EXIT)

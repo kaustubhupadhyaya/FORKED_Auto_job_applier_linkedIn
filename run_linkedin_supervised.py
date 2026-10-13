@@ -3,7 +3,10 @@
 - Launches run_linkedin_local.py as a child process (separate browser/session).
 - Restarts it when it dies from renderer crashes / overlay kills.
 - STOPS (no restart) when: daily Easy Apply limit reached, or two consecutive
-  runs apply nothing (persistent breakage → needs a human), or 6 restarts used.
+  runs apply nothing (persistent breakage → needs a human), or 6 restarts used,
+  or LinkedIn showed a verification wall (exit 48, or a wall recorded in
+  logs/wall-evidence during the attempt), or the sign-in failed (exit 45): each of
+  the last two → NEEDS_HUMAN, no restart today.
 - Single-instance guarded via supervisor.lock.
 """
 import os
@@ -25,6 +28,9 @@ GATE_MARKER = os.path.join(REPO, "logs", "GATE_STOPPED")
 # while today's marker exists (before this, a failed browser launch looped all night).
 NEEDS_HUMAN = os.path.join(REPO, "logs", "NEEDS_HUMAN")
 LAUNCH_FAILED_RC = 43   # run_linkedin_local.py: Chrome/driver could not start
+WALL_RC = 48            # run_linkedin_local.py: LinkedIn verification wall (L2, 2026-10-13); it wrote logs/LINKEDIN_WALL_<date>
+WALL_EVIDENCE_DIR = os.path.join(REPO, "logs", "wall-evidence")   # run_linkedin_local.py: wall-<time>-<where>.json per wall
+SIGNIN_RC = 45          # run_linkedin_local.py: signed out, and its one vault sign-in failed or was already used (2026-10-14)
 # 2026-10-02: at ~260 MB of free RAM Chrome could not start (rc 43) and that single failure parked
 # the bot for the rest of the day. Now: wait (bounded) for free memory before every launch, and
 # retry rc 43 a few times, 5 minutes apart, before asking for a human.
@@ -83,6 +89,17 @@ POLL_SEC = 600               # mid-run progress poll interval
 def gate_marker_fresh(since_ts):
     try:
         return os.path.exists(GATE_MARKER) and os.path.getmtime(GATE_MARKER) >= since_ts
+    except Exception:
+        return False
+
+
+def wall_recorded_since(since_ts):
+    """True when run_linkedin_local.py recorded a verification wall (logs/wall-evidence/wall-*.json) at or after since_ts,
+    whatever exit code the run ended with: the supervisor never restarts into a recorded wall."""
+    try:
+        with os.scandir(WALL_EVIDENCE_DIR) as entries:
+            return any(e.name.startswith("wall-") and e.name.endswith(".json") and e.stat().st_mtime >= since_ts
+                       for e in entries)
     except Exception:
         return False
 
@@ -294,6 +311,15 @@ while True:
     slog(f"attempt {attempt}: exited rc={rc} after {mins:.1f}min "
          f"saved+{gained} run_stats(applied={applied}, failed={failed}).")
 
+    if rc == WALL_RC or wall_recorded_since(attempt_start_ts):
+        # Never restart into a wall (before this, exit 48 fell through to a plain restart, up to 6 times). The keepalive
+        # reads this NEEDS_HUMAN: no relaunch today, one toast.
+        needs_human("LinkedIn verification wall: YOUR TURN, open the linkedin-1 browser profile and clear it")
+        break
+    if rc == SIGNIN_RC:
+        # 2026-10-14: signed out and the run's one vault sign-in failed or was used up. Not a wall: no marker, no hold.
+        needs_human("LinkedIn sign-in failed: YOUR TURN, sign in in the linkedin-1 profile")
+        break
     today_marker = os.path.join(REPO, "logs", f"LINKEDIN_DAILY_LIMIT_{datetime.now():%Y-%m-%d}")
     if os.path.exists(today_marker) or rc == 44:
         slog("daily Easy Apply limit reached — goal achieved, stopping supervisor.")
