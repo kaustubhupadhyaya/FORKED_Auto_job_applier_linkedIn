@@ -10,6 +10,11 @@ A question no fact answers exactly (portal_kit/facts.py) blocks the job: it is d
 question is written verbatim to logs/linkedin_uae_unanswered.jsonl. Every job the pass looks at is one row of
 logs/linkedin_uae_jobs.jsonl; every pass is one row of logs/linkedin_region_cycles.jsonl (the quota counts from it).
 
+Region (U1, 2026-10-14): the pass's searches carry the location in the URL (runAiBot.SEARCH_URL_EXTRA) besides the filter
+dialog's location box, and the URL LinkedIn shows for each term's results is logged and kept on the cycle row. A term whose
+first results page shows at least WRONG_REGION_CARDS cards and none in the UAE stops at once with an outcome 'wrong_region'
+row in the job log; WRONG_REGION_TERMS such terms end the pass and write logs/LINKEDIN_UAE_WRONG_REGION_<date>.
+
 Everything patched on the bot module `R` is restored in a finally block, so the India pass that follows runs the
 unchanged bot. Facts live outside the repo (C:\\Users\\Admin\\.secrets\\gulf_facts.json).
 """
@@ -25,6 +30,7 @@ import unicodedata
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from selenium.common.exceptions import (ElementClickInterceptedException, NoSuchElementException, StaleElementReferenceException)
 from selenium.webdriver.common.by import By
@@ -43,6 +49,15 @@ AI_LOG = LOGS / "ai_answers.jsonl"
 VERIFY_STOP = LOGS / "LINKEDIN_UAE_VERIFY_STOPPED"
 SHOTS = LOGS / "uae-evidence"
 FACTS_PKG = Path(r"C:\Users\Admin\GitHub\job-tracker\portal_kit")
+# U1: appended to the pass's search URLs (runAiBot.SEARCH_URL_EXTRA, '' again for India). The filter dialog still types cfg.SEARCH_LOCATION
+# too, as before; on its own it left 92% of the pass's skips Indian cards.
+UAE_SEARCH_URL_EXTRA = "&location=United%20Arab%20Emirates"
+# The wrong-region stop (U1). A term whose first results page shows at least WRONG_REGION_CARDS cards with a readable location, none of them
+# in the UAE, did not get the UAE (LinkedIn fell back to another region): it stops at once and gets a wrong_region row. WRONG_REGION_TERMS
+# such terms in one pass end the pass and write the day's marker, logs/LINKEDIN_UAE_WRONG_REGION_<date>. Nothing here ever deletes it.
+WRONG_REGION_CARDS = 10
+WRONG_REGION_TERMS = 3
+WRONG_REGION_MARKER = "LINKEDIN_UAE_WRONG_REGION_"
 
 _R = None
 _note = print
@@ -172,6 +187,11 @@ class Pass:
         self.cards_seen = 0                         # every card the pass looked at, including the ones it skipped without a row
         self.uae_cards = 0                          # cards whose own location was in the UAE
         self.placeholders = 0                       # cards still empty after scrolling to them
+        self.term: dict | None = None               # the search term being worked: LinkedIn's URL for it, its first page's cards (U1)
+        self.terms: list = []                       # the finished terms' records, for the cycle row
+        self.wrong_terms: list = []                 # terms whose first results page showed no UAE card (each has a wrong_region row)
+        self.stop: str | None = None                # set when the wrong-region stop ends the whole pass (over_budget reports it)
+        self.paused_switch = 0                      # R.switch_number, held at 0 while a wrong-region term winds down; the next term gets it back
         # roles (company + title) already applied to live: LinkedIn reposts the same role under new job ids
         self.applied_keys = {_role_key(r.get("company"), r.get("title")) for r in _read_jsonl(JOBS_LOG)
                              if r.get("outcome") == "applied" and r.get("mode") == "live"}
@@ -191,6 +211,8 @@ class Pass:
         return {"region": "UAE", "channel": "linkedin", "title": j.get("title"), "company": j.get("company"), "location": j.get("location")}
 
     def over_budget(self) -> str | None:
+        if self.stop:
+            return self.stop                        # the wrong-region stop: no further terms or cards in this pass
         if self.mode == "live" and self.quota_left <= 0:
             return "daily quota"                    # the cap on submissions is a budget too: the remaining terms and cards need not even be loaded
         if self.visits >= self.max_visits:
@@ -337,6 +359,13 @@ def _card_fields(card) -> tuple:
     else:
         company, loc = sub, text("artdeco-entity-lockup__caption")
     return title, company.split("\n")[0].strip(), loc.strip()
+
+
+def _in_uae(location: str) -> bool:
+    """Whether a location names a place in the UAE (config UAE_LOCATION_WORDS, a substring test on the lower-cased text). The one rule for the
+    card's own location, the bot's parse of it and the wrong-region count."""
+    low = (location or "").lower()
+    return any(w in low for w in S.cfg.UAE_LOCATION_WORDS)
 
 
 def _title_problem(title: str) -> str:
@@ -765,21 +794,144 @@ def uae_answer_questions(modal, questions_list, work_location, job_description=N
     return questions_list
 
 
+# ------------------------------------------------------------------ search terms: LinkedIn's own URL and the wrong-region stop (U1)
+# per-click tracking parameters, dropped from a logged jobs URL (compared in lower case; any key starting with "trk" too). Every other
+# parameter stays: U2 pins the search's own ones from these URLs (keywords, location, geoId, f_*, sortBy).
+_URL_DROP = frozenset(("currentjobid", "trackingid", "refid", "lipi", "ebp", "midtoken", "midsig", "otptoken"))
+
+
+def _current_url() -> str:
+    """The browser's URL, kept only for a LinkedIn jobs page (where a search's results are), without its per-click tracking parameters
+    (_URL_DROP and trk*). Any other page, such as a security wall or the sign-in page, is named by its host and first path segment only:
+    those URLs carry tokens and do not belong in a log. Never raises."""
+    try:
+        url = str(_R.driver.current_url or "")
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if (host == "linkedin.com" or host.endswith(".linkedin.com")) and parts.path.lower().startswith("/jobs"):
+            kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                    if k.lower() not in _URL_DROP and not k.lower().startswith("trk")]
+            # quote, not urlencode's default quote_plus: a space stays %20 and a comma %2C, as LinkedIn writes them
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept, quote_via=quote), parts.fragment))
+        return f"(not a LinkedIn jobs page: {host or '?'}/{parts.path.strip('/').split('/')[0][:24]})"
+    except Exception as e:
+        return f"(unreadable: {type(e).__name__})"
+
+
+def _open_term(term) -> None:
+    """A search term starts (_Terms calls this just before apply_to_jobs loads the term's search page). A term stopped for its region held
+    R.switch_number at 0 only to end itself, so the new term gets the number back. Nothing else can have zeroed it in between: after that stop
+    the bot only breaks out of its card loop and its page loop, and a stop that ends the whole pass is in over_budget, which _Terms checks first."""
+    if S.paused_switch and not _R.switch_number:
+        _R.switch_number = S.paused_switch
+    S.paused_switch = 0
+    S.term = {"term": str(term), "url": None, "page": 0, "page1_cards": 0, "page1_uae": 0, "judged": False, "stop": None}
+
+
+def _term_url() -> None:
+    """Keep and log the URL LinkedIn shows for the term's results, once per term. Read at the term's first card, which comes after the filter
+    dialog, the bot's wait for the result list and its 3 s buffer: the URL of the results the pass really works through."""
+    t = S.term
+    if t is not None and t["url"] is None:
+        t["url"] = _current_url()
+        _note(f"uae: search '{t['term']}': LinkedIn's URL for the results is {t['url']}")
+
+
+def _term_counting() -> bool:
+    """True while the open term is still on its first results page and has not been judged."""
+    t = S.term
+    return t is not None and t["page"] == 1 and not t["judged"]
+
+
+def _term_card(location: str) -> None:
+    """Count one first-page card that shows a location, for the wrong-region test. Cards handled in an earlier pass count too: the test is about
+    what LinkedIn returned, and a page whose UAE cards were all handled before is not a wrong region."""
+    if not location or not _term_counting():
+        return
+    S.term["page1_cards"] += 1
+    if _in_uae(location):
+        S.term["page1_uae"] += 1
+
+
+def _judge_term(t: dict) -> bool:
+    """The wrong-region test, once per term, when its first results page is over. True, with a wrong_region row in the job log, when the page
+    showed at least WRONG_REGION_CARDS cards with a location and none in the UAE. The WRONG_REGION_TERMS-th such term ends the pass."""
+    t["judged"] = True
+    if t["page1_cards"] < WRONG_REGION_CARDS or t["page1_uae"]:
+        return False
+    t["stop"] = "wrong_region"
+    S.counts["wrong_region"] += 1
+    S.wrong_terms.append({"term": t["term"], "url": t["url"], "cards": t["page1_cards"]})
+    n = len(S.wrong_terms)
+    # a term row, not a job row: no job_id; ts, mode and outcome are there because every reader of the job log keys on them
+    _jsonl(JOBS_LOG, {"ts": datetime.now().isoformat(timespec="seconds"), "mode": S.mode, "facts_rev": S.facts.rev, "outcome": "wrong_region",
+                      "term": t["term"], "url": t["url"], "cards": t["page1_cards"], "uae_cards": 0,
+                      "reason": f"the first results page showed {t['page1_cards']} cards with a location and none in the UAE"})
+    _note(f"uae: search '{t['term']}' stopped: its first results page showed {t['page1_cards']} cards and none in the UAE "
+          f"(wrong-region terms in this pass: {n}; {WRONG_REGION_TERMS} end it)")
+    if n >= WRONG_REGION_TERMS:
+        S.stop = f"the wrong-region stop ({n} search terms showed no UAE card on their first results page)"
+        _R.switch_number = 0
+        _wrong_region_marker()
+        _note(f"uae: {S.stop}; the pass ends (logs\\{WRONG_REGION_MARKER}{date.today().isoformat()})")
+    return True
+
+
+def _wrong_region_marker() -> None:
+    """logs/LINKEDIN_UAE_WRONG_REGION_<date>, with the terms and the URLs LinkedIn showed for them. One a day: an existing marker is kept, so
+    'since' stays the day's first stop. Never raises."""
+    path = LOGS / f"{WRONG_REGION_MARKER}{date.today().isoformat()}"
+    try:
+        if path.exists():
+            return
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"since": datetime.now().isoformat(timespec="seconds"), "mode": S.mode, "facts_rev": S.facts.rev,
+                                   "what": f"{len(S.wrong_terms)} search terms in one UAE pass showed at least {WRONG_REGION_CARDS} cards and "
+                                           "none in the UAE on their first results page, so the pass was ended",
+                                   "terms": S.wrong_terms}, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        _note(f"uae: {path.name} not written: {e!r}")
+
+
+def _close_term(judge: bool) -> None:
+    """The open term is over; its record goes to the cycle row. Its first page is judged here when the term ended while still on it (one page
+    of results, or the list ran out) and the pass was not stopping: R.switch_number 0 means a budget, the quota or a verification stop cut the
+    page short. judge=False (the finally block, after an early return or an exception) is a page cut short too."""
+    t = S.term
+    if t is None:
+        return
+    S.term = None
+    if t["url"] is None:                        # no result card was reached: the URL the term's search ended on
+        t["url"] = _current_url()
+        _note(f"uae: search '{t['term']}': no result card reached; LinkedIn's URL is {t['url']}")
+    if judge and not t["judged"] and _R.switch_number:
+        _judge_term(t)
+    S.terms.append({"term": t["term"], "url": t["url"], "pages": t["page"], "page1_cards": t["page1_cards"],
+                    "page1_uae": t["page1_uae"], "stop": t["stop"]})
+
+
 # ------------------------------------------------------------------ patches on the bot module, all undone in a finally
 def _patches(R) -> dict:
+    # get_page_info is run_linkedin_local.py's L2 wrapper (its wall check, then the bot's own): page_info below calls it, so the check stays
     orig = {n: getattr(R, n) for n in ("answer_questions", "wait_span_click", "get_job_main_details", "submitted_jobs", "failed_job",
-                                       "get_applied_job_ids", "external_apply", "print_lg", "discard_job", "upload_resume")}
+                                       "get_applied_job_ids", "external_apply", "print_lg", "discard_job", "upload_resume", "get_page_info")}
 
     def print_lg(*msgs, **kw):
         # apply_to_jobs logs 'Successfully saved "<job>"' after every job it did not skip, including an inventory job it discarded.
         # run_linkedin_supervised.py counts those lines as applications for its yield watchdog, so say what really happened.
         if msgs and isinstance(msgs[0], str) and msgs[0].startswith("Successfully saved") and not (S.job or {}).get("really_applied"):
             msgs = ("UAE pass: nothing was submitted for" + msgs[0][len("Successfully saved"):],) + msgs[1:]
+        # page_info hands back no pagination element to stop a wrong-region term (U1); the bot then blames the page for it
+        if (msgs and isinstance(msgs[0], str) and msgs[0].startswith("Couldn't find pagination element")
+                and (S.term or {}).get("stop") == "wrong_region"):
+            msgs = (f"UAE pass: search '{S.term['term']}' stopped after its first results page (no UAE card on it).",) + msgs[1:]
         return orig["print_lg"](*msgs, **kw)
 
     def details(job, blacklisted_companies, rejected_jobs):
         # Decide from the card's own id BEFORE the runner's per-job pacing wait (8-20 s) and card click: once the job pool is
         # saturated every card is already handled, and the pass must neither burn that time nor outlive its budget.
+        _term_url()                                  # the term's first card: keep the URL LinkedIn shows for these results (U1)
         try:
             card_id = str(job.get_dom_attribute("data-occludable-job-id") or "")
         except Exception:
@@ -793,6 +945,8 @@ def _patches(R) -> dict:
         _render_card(job)                            # before any decision: the list only renders what is near the viewport
         S.cards_seen += 1
         if card_id and (card_id in S.handled or card_id in S.seen):
+            if _term_counting():
+                _term_card(_card_fields(job)[2])     # still part of what the first page shows (the wrong-region test)
             return (card_id, "Unknown", "Unknown", "", "", True)
         # The card shows its own location: a job outside the UAE is rejected here, before the bot clicks it and waits its per-job pacing
         # (the first real pass spent 24 minutes of its 45 on 48 cards it then rejected one by one).
@@ -804,7 +958,8 @@ def _patches(R) -> dict:
             # still an empty placeholder after scrolling to it: nothing to decide on, and the bot's own path would only wait its pacing and fail
             S.placeholders += 1
             return (card_id, "Unknown", "Unknown", "", "", True)
-        if card_id and loc0 and not any(w in loc0.lower() for w in S.cfg.UAE_LOCATION_WORDS):
+        _term_card(loc0)
+        if card_id and loc0 and not _in_uae(loc0):
             S.begin(card_id, title0, company0, loc0, "", count=False)
             S.finish("skipped_job", f"location is not in the UAE: {loc0}")
             S.loc_skips += 1
@@ -825,6 +980,8 @@ def _patches(R) -> dict:
             return (card_id, title0, company0, loc0, "", True)
         res = orig["get_job_main_details"](job, blacklisted_companies, rejected_jobs)
         job_id, title, company, location, style, skip = res
+        if not loc0:
+            _term_card(location)                     # the card showed no location of its own: the bot's parse is what it shows
         if skip:
             _calibrate_card(job, str(job_id))
             return res
@@ -842,8 +999,7 @@ def _patches(R) -> dict:
             return (job_id, title, company, location, style, True)
         if not location and loc0:                    # the card went stale during the bot's own parse: the early read of its location stands
             location = re.sub(r"\s*\((on-site|hybrid|remote)\)\s*$", "", loc0, flags=re.I)
-        low = (location or "").lower()
-        if not any(w in low for w in S.cfg.UAE_LOCATION_WORDS):
+        if not _in_uae(location):
             R.print_lg(f'UAE pass: "{title} | {company}" is in "{location}", not the UAE. Skipping.')
             S.begin(job_id, title, company, location, style, count=False)
             S.finish("skipped_job", f"location is not in the UAE: {location}")
@@ -990,22 +1146,45 @@ def _patches(R) -> dict:
             S.finish("no_easy_apply", "no Easy Apply button (external apply is not used in the UAE pass)")
         return True, "External (skipped in the UAE pass)", R.tabs_count
 
+    def page_info(*args, **kwargs):
+        # apply_to_jobs calls this once per results page, before reading its cards. The runner's wall check (L2) runs first, as before.
+        res = orig["get_page_info"](*args, **kwargs)
+        t = S.term
+        if t is None:
+            return res
+        t["page"] += 1
+        if t["page"] == 2 and not t["judged"] and _judge_term(t):
+            # The first page showed no UAE card: stop the term at once. With switch_number 0 the bot leaves its card loop before this page's
+            # first card, and with no pagination element it ends the term instead of clicking on to another page. _open_term gives the next
+            # term its switch_number back (unless the stop ended the whole pass, which already set it to 0).
+            if not S.stop:
+                S.paused_switch = R.switch_number
+                R.switch_number = 0
+            return None, None
+        return res
+
     R.answer_questions, R.wait_span_click, R.get_job_main_details = uae_answer_questions, submit_click, details
     R.submitted_jobs, R.failed_job, R.get_applied_job_ids, R.external_apply = submitted, failed, get_applied, external
-    R.discard_job, R.upload_resume, R.print_lg = discard_job, upload_resume, print_lg
+    R.discard_job, R.upload_resume, R.print_lg, R.get_page_info = discard_job, upload_resume, print_lg, page_info
     return orig
 
 
 class _Terms(list):
     """The search terms, which stop being handed out once the pass is over its budget (each remaining term would otherwise still load
-    a search page and its filters before finding nothing to do)."""
+    a search page and its filters before finding nothing to do). apply_to_jobs asks for the next term when the previous one is over, so
+    this is also where each term's record (U1) is closed and the next one opened."""
 
     def __iter__(self):
         for term in list.__iter__(self):
-            if S is not None and S.over_budget():
-                _note(f"uae: {S.over_budget()} reached; the remaining search terms are skipped")
-                return
+            if S is not None:
+                _close_term(judge=True)
+                if S.over_budget():
+                    _note(f"uae: {S.over_budget()} reached; the remaining search terms are skipped")
+                    return
+                _open_term(term)
             yield term
+        if S is not None:
+            _close_term(judge=True)
 
 
 def _write_shortlist() -> None:
@@ -1066,6 +1245,7 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
     try:
         R.search_location, R.experience_level, R.job_type = cfg.SEARCH_LOCATION, list(cfg.EXPERIENCE_LEVEL), list(cfg.JOB_TYPE)
         R.date_posted, R.sort_by, R.switch_number = cfg.DATE_POSTED, cfg.SORT_BY, int(cfg.SWITCH_NUMBER)
+        R.SEARCH_URL_EXTRA = UAE_SEARCH_URL_EXTRA       # U1: the location in the search URL itself; '' again in the finally below
         R.bad_words = list(saved_attrs["bad_words"]) + list(cfg.BAD_WORDS_EXTRA)
         terms = list(cfg.SEARCH_TERMS)
         k = (date.today().toordinal() * 3) % len(terms)           # rotate the start so every term gets its turn over the days
@@ -1074,8 +1254,13 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
         _note(f"uae: {mode} pass starts ({len(terms)} terms, facts {facts.rev}, quota left {S.quota_left if mode == 'live' else 'n/a'})")
         orig_apply(terms)
     finally:
+        R.SEARCH_URL_EXTRA = ""                         # first, so nothing below can stop the India pass searching exactly as before
         try:
             S.finish("no_outcome", "the pass ended while this job was open")
+        except Exception:
+            pass
+        try:
+            _close_term(judge=False)                # a term still open after an early return or an exception: recorded, not judged
         except Exception:
             pass
         if saved_funcs:
@@ -1090,21 +1275,26 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
         # a pass that looked at no card at all (it stopped at LinkedIn's limit banner) did nothing: it must not start the min-gap clock; one that only met
         # handled or rejected cards did run, and without a cycle row it would run again every cycle, burning minutes the India pass needs
         if S.visits or sum(S.counts.values()) or S.cards_seen:
+            # U1 fields: uae_cards / loc_skips are the cards not handled before whose own location was / was not in the UAE (the pass's
+            # existing counters); wrong_region counts the terms whose first page showed no UAE card; terms holds, per search term, the URL
+            # LinkedIn showed for its results, how many result pages it went through, its first page's cards with a location and how many
+            # of those were in the UAE (handled cards included), and stop: "wrong_region" for such a term, else None
             _jsonl(CYCLES_LOG, {"start": start.isoformat(timespec="seconds"), "end": datetime.now().isoformat(timespec="seconds"), "region": "UAE",
-                                "cards": S.cards_seen, "placeholders": S.placeholders,
+                                "cards": S.cards_seen, "placeholders": S.placeholders, "uae_cards": S.uae_cards, "loc_skips": S.loc_skips,
                                 "mode": mode, "applied": S.counts["applied"], "verified": S.counts["verified"],
                                 "verify_failed": S.counts["verify_failed"], "would_apply": S.counts["would_apply"],
                                 "held_ai": S.counts["held_ai"],
                                 "skipped_unanswerable": S.counts["skipped_unanswerable"], "skipped_job": S.counts["skipped_job"],
                                 "no_easy_apply": S.counts["no_easy_apply"], "failed": S.counts["failed"], "visits": S.visits,
-                                "facts_rev": facts.rev})
+                                "wrong_region": S.counts["wrong_region"], "facts_rev": facts.rev, "terms": S.terms})
         _write_shortlist()
         if S.visits == 0 and S.cards_seen >= 10 and S.uae_cards == 0:
             # exactly what a changed card layout looks like (the first real pass: 48 cards, every one "not in the UAE", none opened). A normal day with
             # an exhausted UAE pool still shows UAE cards (handled or filtered), only padding from India shows none at all.
             _note(f"uae: WARNING: {S.cards_seen} cards were looked at and none had a UAE location; if that is not the search's real result, the "
                   "card layout has changed again (HTML of the first rejected cards is in logs\\uae-evidence)")
-        _note(f"uae: {mode} pass ended: {dict(S.counts)} over {S.visits} jobs ({S.cards_seen} cards looked at, {S.placeholders} empty placeholders)")
+        _note(f"uae: {mode} pass ended: {dict(S.counts)} over {S.visits} jobs ({S.cards_seen} cards looked at, {S.placeholders} empty placeholders, "
+              f"{S.uae_cards} new cards in the UAE, {S.loc_skips} rejected by location, {len(S.terms)} search terms)")
 
 
 def install(R, note) -> None:

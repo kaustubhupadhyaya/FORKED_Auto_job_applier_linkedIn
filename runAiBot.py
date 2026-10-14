@@ -75,6 +75,10 @@ failed_count = 0
 skip_count = 0
 dailyEasyApplyLimitReached = False
 
+# Appended as-is to every job-search URL in apply_to_jobs. Empty for the India run, so its searches are exactly what they were. The UAE
+# pass (linkedin_uae_overlay.py) sets it for its own searches only and puts '' back in its finally block (U1, 2026-10-14).
+SEARCH_URL_EXTRA = ''
+
 DAILY_LIMIT_MARKERS = (
     "exceeded the daily application limit",
     "limit daily submissions",
@@ -1025,7 +1029,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
 
     if randomize_search_order:  shuffle(search_terms)
     for searchTerm in search_terms:
-        driver.get(f"https://www.linkedin.com/jobs/search/?keywords={searchTerm}")
+        driver.get(f"https://www.linkedin.com/jobs/search/?keywords={searchTerm}{SEARCH_URL_EXTRA}")
         print_lg("\n________________________________________________________________________________________________________________________\n")
         print_lg(f'\n>>>> Now searching for "{searchTerm}" <<<<\n\n')
 
