@@ -15,6 +15,13 @@ dialog's location box, and the URL LinkedIn shows for each term's results is log
 first results page shows at least WRONG_REGION_CARDS cards and none in the UAE stops at once with an outcome 'wrong_region'
 row in the job log; WRONG_REGION_TERMS such terms end the pass and write logs/LINKEDIN_UAE_WRONG_REGION_<date>.
 
+U3 (2026-10-17): the title gate refuses lead / staff / principal / head / manager / architect / director / vp / chief roles (his decision D1,
+config/region_uae.py); the bot's did_masters experience bonus is off during the pass; a skip made by the "actively reviewing applicants"
+filter is looked at again after FILTER_REOPEN_HOURS.
+U4 (2026-10-17): a job already applied to through another tool, or by hand, is skipped (portal_kit/dedupe.py; a live pass that cannot
+load it refuses every job); every live Submit re-reads the arming file first and ends the pass if it is no longer a live one; the arming
+file's end writes logs/LINKEDIN_UAE_ARMING_ENDS (2 days or less left) or logs/LINKEDIN_UAE_ARMING_EXPIRED, each with one toast a day.
+
 Everything patched on the bot module `R` is restored in a finally block, so the India pass that follows runs the
 unchanged bot. Facts live outside the repo (C:\\Users\\Admin\\.secrets\\gulf_facts.json).
 """
@@ -58,6 +65,17 @@ UAE_SEARCH_URL_EXTRA = "&location=United%20Arab%20Emirates"
 WRONG_REGION_CARDS = 10
 WRONG_REGION_TERMS = 3
 WRONG_REGION_MARKER = "LINKEDIN_UAE_WRONG_REGION_"
+# U3: a skip made by the bot's "actively reviewing applicants" filter (reason "Filter: ...") holds for a day only: LinkedIn's applicant status
+# of a job changes, so the job is looked at again after this many hours, for FILTER_REOPEN_MAX_DAYS days after that skip (an older job is left
+# alone, so the daily re-checks cannot use up the visit budget). (A pass never opens the same job twice itself.)
+FILTER_REOPEN_HOURS = 24
+FILTER_REOPEN_MAX_DAYS = 7
+# U4: the arming file's end. Until 2 days or less are left, nothing is written; then logs/LINKEDIN_UAE_ARMING_ENDS; once the date has passed,
+# logs/LINKEDIN_UAE_ARMING_EXPIRED (before this the pass went quiet on 2026-10-12 and nothing said so). Each marker is kept as first written and has
+# one toast a day. A valid file removes the EXPIRED marker; one with more than 2 days left also removes the ENDS marker (a fresh arming).
+ARMING_ENDS_DAYS = 2
+ARMING_ENDS_MARKER = "LINKEDIN_UAE_ARMING_ENDS"
+ARMING_EXPIRED_MARKER = "LINKEDIN_UAE_ARMING_EXPIRED"
 
 _R = None
 _note = print
@@ -86,6 +104,45 @@ def _read_jsonl(path: Path) -> list:
     return out
 
 
+_GUARD = None
+
+
+def _toast_once(key: str, title: str, body: str) -> None:
+    """One Windows toast per key per day, through the registry the keepalives share (portal_kit/site_guard.notify_once, loaded by path like
+    facts.py). A toast that cannot be shown must never disturb the pass: any failure is noted and swallowed."""
+    global _GUARD
+    try:
+        if _GUARD is None:
+            _GUARD = _load(FACTS_PKG / "site_guard.py", "uae_site_guard")
+        _GUARD.notify_once(key, title, body, by="linkedin_uae_overlay")
+    except Exception as e:
+        _note(f"uae: toast {key} not shown: {type(e).__name__}: {str(e)[:100]}")
+
+
+def _arming_marker(name: str, text: str) -> None:
+    """logs/<name> with `text`, written once (an existing marker keeps the time it was first written), then one toast a day for it. Never raises."""
+    path = LOGS / name
+    try:
+        if not path.exists():
+            LOGS.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}\n", encoding="utf-8")
+            tmp.replace(path)
+    except OSError as e:
+        _note(f"uae: {name} not written: {e!r}")
+    _toast_once(f"linkedin:{name}", "LinkedIn UAE pass: arming " + ("ended" if name == ARMING_EXPIRED_MARKER else "ends soon"), text)
+
+
+def _clear_arming_markers(*names: str) -> None:
+    for name in (names or (ARMING_ENDS_MARKER, ARMING_EXPIRED_MARKER)):
+        try:
+            (LOGS / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            _note(f"uae: {name} not removed: {e!r}")
+
+
 def _armed() -> dict | None:
     try:
         arm = json.loads(ARM_FILE.read_text(encoding="utf-8-sig"))     # a BOM from a Windows editor must not silently disarm
@@ -94,17 +151,48 @@ def _armed() -> dict | None:
     except Exception as e:
         _note(f"uae: arming file unreadable ({e!r}); India only")
         return None
-    if arm.get("mode") not in ("inventory", "live"):
+    if not isinstance(arm, dict) or arm.get("mode") not in ("inventory", "live"):
         return None
     try:
         until = date.fromisoformat(str(arm.get("until"))[:10])
     except Exception:
         _note("uae: arming file has no valid 'until' date; India only")
         return None
-    if until < date.today():
+    left = (until - date.today()).days
+    if left < 0:
         _note(f"uae: arming expired on {until}; India only")
+        _arming_marker(ARMING_EXPIRED_MARKER, f"The UAE pass arming file ended on {until}, so the pass is off. To go on, write a new until date in "
+                                              "logs\\LINKEDIN_UAE_ARMED (arming is your decision).")
         return None
+    _clear_arming_markers(ARMING_EXPIRED_MARKER)             # a valid file: an earlier expiry is over
+    if left <= ARMING_ENDS_DAYS:
+        _arming_marker(ARMING_ENDS_MARKER, f"The UAE pass arming file ends on {until} ({left} day{'s' if left != 1 else ''} left). "
+                                           "Write a later until date in logs\\LINKEDIN_UAE_ARMED to keep it going.")
+    else:
+        _clear_arming_markers(ARMING_ENDS_MARKER)
     return arm
+
+
+def _hours_since(ts, now: datetime) -> float:
+    """Hours between an ISO timestamp from the job log and `now`; 0.0 when it cannot be read (an unreadable row is never treated as old)."""
+    try:
+        return (now - datetime.fromisoformat(str(ts)[:19])).total_seconds() / 3600
+    except Exception:
+        return 0.0
+
+
+def _load_dedupe():
+    """(module, others, error, partial): every application another tool or the user made (portal_kit/dedupe.py: the applier databases, the manual
+    list and this pass's own live applications) as (source, company, title); error is why it could not be read at all (module None); partial lists
+    the sources that exist but could not be read (a locked database): the duplicate check is then incomplete."""
+    try:
+        mod = _load(FACTS_PKG / "dedupe.py", "uae_dedupe")
+        report: list = []
+        records = mod.applied_records(report=report)
+        partial = [f"{r.get('source')}: {r.get('note')}" for r in report if r.get("rows") is None and str(r.get("note", "")).startswith("unreadable")]
+        return mod, [(r["source"], r["company"], r["title"]) for r in records], "", partial
+    except Exception as e:
+        return None, [], f"{type(e).__name__}: {str(e)[:120]}", []
 
 
 _CODE_BASE = ""
@@ -195,13 +283,22 @@ class Pass:
         # roles (company + title) already applied to live: LinkedIn reposts the same role under new job ids
         self.applied_keys = {_role_key(r.get("company"), r.get("title")) for r in _read_jsonl(JOBS_LOG)
                              if r.get("outcome") == "applied" and r.get("mode") == "live"}
+        # U4: what every other tool and the user applied to (the same opening is never applied to twice); _dup_reason reads these
+        self.dedupe, self.others, self.dedupe_error, self.dedupe_partial = _load_dedupe()
 
     def _handled_ids(self) -> set:
         """Jobs not worth opening again: applied, or skipped under the same facts file and resolver. A job inventoried as answerable
-        is handled for another inventory pass, but a live pass is exactly where it should be applied to."""
+        is handled for another inventory pass, but a live pass is exactly where it should be applied to. A skip by the "actively reviewing
+        applicants" filter (reason "Filter: ...") is the exception: LinkedIn's status of a job changes, so after FILTER_REOPEN_HOURS it is
+        looked at again (U3)."""
         done = set()
+        now = datetime.now()
         for r in _read_jsonl(JOBS_LOG):
             o, same = r.get("outcome"), r.get("facts_rev") == self.facts.rev
+            if o == "skipped_job" and str(r.get("reason", "")).startswith("Filter:"):
+                age_h = _hours_since(r.get("ts"), now)
+                if FILTER_REOPEN_HOURS <= age_h <= FILTER_REOPEN_MAX_DAYS * 24:
+                    continue
             if o == "applied" or (same and o in ("skipped_unanswerable", "skipped_job", "held_ai")) or (same and o == "would_apply" and self.mode == "inventory"):
                 done.add(str(r.get("job_id")))
         return done
@@ -387,6 +484,23 @@ def _title_problem(title: str) -> str:
     if has(tuple(getattr(S.cfg, "TITLE_TECH", ()) or ())) and has(tuple(getattr(S.cfg, "TITLE_ROLE", ()) or ())):
         return ""
     return f"title is not a data-engineering role: {title}"
+
+
+def _dup_reason(company: str, title: str) -> str:
+    """Why this job is a role already applied to through another tool or by hand ("" when it is not): U4's cross-channel gate, beside the
+    pass's own applied_keys check. A live pass that could not load or run the check refuses the job (fail closed: it must never apply twice);
+    an inventory pass applies nothing, so it only notes that the check is off (once, when the pass starts)."""
+    if not (company and title):
+        return ""
+    if S.dedupe is None:
+        return f"duplicate check unavailable ({S.dedupe_error})" if S.mode == "live" else ""
+    if S.dedupe_partial and S.mode == "live":
+        return f"duplicate check incomplete ({'; '.join(S.dedupe_partial)[:120]})"
+    try:
+        why = S.dedupe.duplicate_of({"company": company, "title": title, "job_id": ""}, None, S.others)
+    except Exception as e:
+        return f"duplicate check failed ({type(e).__name__})" if S.mode == "live" else ""
+    return f"duplicate: {why}" if why else ""
 
 
 def _dump_card(card, job_id: str) -> None:
@@ -892,6 +1006,9 @@ def _wrong_region_marker() -> None:
         tmp.replace(path)
     except OSError as e:
         _note(f"uae: {path.name} not written: {e!r}")
+        return
+    _toast_once(f"linkedin:{WRONG_REGION_MARKER.rstrip('_')}", "LinkedIn UAE pass stopped: wrong region",
+                f"{len(S.wrong_terms)} search terms showed no UAE job on their first page, so the pass was ended. Details: logs\\{path.name}.")
 
 
 def _close_term(judge: bool) -> None:
@@ -978,6 +1095,11 @@ def _patches(R) -> dict:
             S.begin(card_id, title0, company0, loc0, "", count=False)
             S.finish("skipped_job", "the same role at the same company was already applied to under another job id")
             return (card_id, title0, company0, loc0, "", True)
+        dup = _dup_reason(company0, title0) if card_id else ""
+        if dup:                                      # the same opening through another tool or by hand (U4)
+            S.begin(card_id, title0, company0, loc0, "", count=False)
+            S.finish("failed" if dup.startswith("duplicate check") else "skipped_job", dup)     # a check that could not run is retried later, not remembered as a skip
+            return (card_id, title0, company0, loc0, "", True)
         res = orig["get_job_main_details"](job, blacklisted_companies, rejected_jobs)
         job_id, title, company, location, style, skip = res
         if not loc0:
@@ -996,6 +1118,11 @@ def _patches(R) -> dict:
         if title and company and _role_key(company, title) in S.applied_keys:
             S.begin(job_id, title, company, location, style, count=False)
             S.finish("skipped_job", "the same role at the same company was already applied to under another job id")
+            return (job_id, title, company, location, style, True)
+        dup = _dup_reason(company, title)
+        if dup:                                      # the bot's own parse, when the card's elements gave nothing to decide on (U4)
+            S.begin(job_id, title, company, location, style, count=False)
+            S.finish("failed" if dup.startswith("duplicate check") else "skipped_job", dup)
             return (job_id, title, company, location, style, True)
         if not location and loc0:                    # the card went stale during the bot's own parse: the early read of its location stands
             location = re.sub(r"\s*\((on-site|hybrid|remote)\)\s*$", "", loc0, flags=re.I)
@@ -1064,8 +1191,25 @@ def _patches(R) -> dict:
                 # the bot's own except path discards the modal after this refusal
                 R.print_lg(f"UAE pass: Submit refused, job is blocked ({blocked[:90]}).")
                 return False
-            # AI-written selections are never submitted until the user has read the first ones and set "ai_live" in the arming file
-            hold_ai = S.mode == "live" and bool(S.job.get("ai_answered")) and S.arm.get("ai_live") is not True
+            arm_now = S.arm
+            if S.mode == "live":
+                # U4: the arming file is read again before EVERY live Submit. A file that is gone, expired, unreadable or no longer "live" (the user
+                # took it back, or changed it to inventory) refuses this Submit and ends the pass; the application is discarded, to be retried later.
+                # One more read after a moment first: an editor saving the file at that instant must not end the pass.
+                arm_now = _armed()
+                if not arm_now:
+                    time.sleep(0.4)
+                    arm_now = _armed()
+                if not arm_now or arm_now.get("mode") != "live":
+                    why = "the arming file is missing, expired or no longer live"
+                    S.job["blocked"] = f"{why}: Submit refused"
+                    S.job["block_transient"] = True
+                    S.stop = f"{why} (re-read before this Submit)"
+                    R.switch_number = 0
+                    R.print_lg(f"UAE pass: Submit refused, {why}; the pass ends.")
+                    return False
+            # AI-written selections are never submitted until the user has read the first ones and set "ai_live" in the arming file (the fresh read)
+            hold_ai = S.mode == "live" and bool(S.job.get("ai_answered")) and arm_now.get("ai_live") is not True
             if S.mode == "inventory" or S.job.get("uses_proposed") or hold_ai:
                 # would_apply only when a Submit button is really there: the bot's finally asks for Submit after a stuck loop, a
                 # timeout or an unread page too, and those jobs are not "answered completely"
@@ -1238,7 +1382,7 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
             _note(f"uae: a {mode} pass ran {ago:.1f} h ago (minimum gap {gap_h:g} h); India only")
             return
     start = datetime.now()
-    keys = ("search_location", "experience_level", "job_type", "date_posted", "sort_by", "switch_number", "bad_words")
+    keys = ("search_location", "experience_level", "job_type", "date_posted", "sort_by", "switch_number", "bad_words", "did_masters")
     saved_attrs = {k: getattr(R, k) for k in keys}
     saved_counts = {k: getattr(R, k) for k in ("easy_applied_count", "failed_count", "skip_count", "external_jobs_count")}
     saved_funcs = None
@@ -1246,12 +1390,18 @@ def _uae_pass(R, arm: dict, orig_apply) -> None:
         R.search_location, R.experience_level, R.job_type = cfg.SEARCH_LOCATION, list(cfg.EXPERIENCE_LEVEL), list(cfg.JOB_TYPE)
         R.date_posted, R.sort_by, R.switch_number = cfg.DATE_POSTED, cfg.SORT_BY, int(cfg.SWITCH_NUMBER)
         R.SEARCH_URL_EXTRA = UAE_SEARCH_URL_EXTRA       # U1: the location in the search URL itself; '' again in the finally below
+        R.did_masters = False                           # U3: "master" in a description raises the bot's experience ceiling by 2 years; not for the UAE pass (D1)
         R.bad_words = list(saved_attrs["bad_words"]) + list(cfg.BAD_WORDS_EXTRA)
         terms = list(cfg.SEARCH_TERMS)
         k = (date.today().toordinal() * 3) % len(terms)           # rotate the start so every term gets its turn over the days
         terms = _Terms(terms[k:] + terms[:k])
         saved_funcs = _patches(R)
-        _note(f"uae: {mode} pass starts ({len(terms)} terms, facts {facts.rev}, quota left {S.quota_left if mode == 'live' else 'n/a'})")
+        _note(f"uae: {mode} pass starts ({len(terms)} terms, facts {facts.rev}, quota left {S.quota_left if mode == 'live' else 'n/a'}; "
+              + (f"duplicate check on: {len(S.others)} applications by other tools or by hand"
+                 + (f"; INCOMPLETE, a source could not be read ({'; '.join(S.dedupe_partial)[:100]})" + ("; every job is refused" if mode == "live" else "")
+                    if S.dedupe_partial else "")
+                 if S.dedupe is not None
+                 else f"duplicate check UNAVAILABLE ({S.dedupe_error})" + ("; every job is refused" if mode == "live" else "")) + ")")
         orig_apply(terms)
     finally:
         R.SEARCH_URL_EXTRA = ""                         # first, so nothing below can stop the India pass searching exactly as before

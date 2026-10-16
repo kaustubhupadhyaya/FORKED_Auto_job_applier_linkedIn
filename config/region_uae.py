@@ -36,7 +36,7 @@ DAILY_QUOTA = 12           # live applications a day in the UAE pass; the India 
 # they belong to the later AI Engineer identity (the resume this pass sends is the Data Platform one); MLOps is a platform role and stays.
 TITLE_ANY = (
     "data engineer", "data engineering", "data platform", "data warehouse", "data warehousing", "data lake", "data lakehouse", "lakehouse engineer",
-    "data pipeline", "data infrastructure", "data integration", "data developer", "data architect", "big data", "analytics engineer",
+    "data pipeline", "data infrastructure", "data integration", "data developer", "big data", "analytics engineer",
     "analytic engineer", "cloud data", "dataops", "mlops", "bi engineer", "bi engineering", "business intelligence engineer", "sql developer", "database developer", "database engineer", "azure data factory", "hadoop developer",
     "hadoop engineer",
 )
@@ -44,10 +44,16 @@ TITLE_PATTERNS = (
     r"\bdata\b[^,;()]{0,25}\bengineer(s|ing)?\b",       # Data Platform Engineer, Data Quality Engineer, Data Lineage Engineer, Data Operations Engineer
 )
 TITLE_TECH = ("etl", "elt", "dwh", "spark", "pyspark", "airflow", "dbt", "kafka", "snowflake", "databricks", "hadoop", "informatica", "ssis", "talend")
-TITLE_ROLE = ("engineer", "engineers", "developer", "developers", "architect", "consultant", "specialist", "programmer", "lead")
+TITLE_ROLE = ("engineer", "engineers", "developer", "developers", "consultant", "specialist", "programmer")
 # Words that rule a job out even when a data word is in the title (the user has about three years of experience and is not looking for these).
 # Kept short on purpose: anything else that is not a data role is already refused by the lists above ("Data Engineer (Sales Analytics)" is fine).
-TITLE_NONE = ("intern", "internship", "trainee", "apprentice", "fresher", "graduate programme", "graduate program", "scientist")
+# U3 (2026-10-17, his decision D1 of 2026-10-08): leadership and architect titles are out too: "Lead Data Engineer", "Staff Data Engineer",
+# "Principal Data Engineer", "Head of Data", "Data Engineering Manager", "Data Architect", "Director of Data", "VP Data", "Chief Data Officer".
+# Whole words only (the title gate matches \bword(s)?\b): "leadership" and "headquarters" do not match "lead" and "head".
+TITLE_NONE = ("intern", "internship", "trainee", "apprentice", "fresher", "graduate programme", "graduate program", "scientist",
+              "lead", "staff", "principal", "head", "manager", "architect", "director", "vp", "chief",
+              # the same kind of seniority written another way (found in review of the real titles): "Team Leader", "Supervisor", "SVP", "CTO" ...
+              "leader", "leadership", "supervisor", "svp", "avp", "cto", "cdo", "president")
 
 # A job card's location must look like the UAE, or the job is skipped (a "United Arab Emirates" search can return remote roles elsewhere).
 UAE_LOCATION_WORDS = ("uae", "united arab emirates", "dubai", "abu dhabi", "sharjah", "ajman", "ras al khaimah", "fujairah",
