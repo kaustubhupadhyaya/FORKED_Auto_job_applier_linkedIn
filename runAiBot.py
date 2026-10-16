@@ -45,6 +45,8 @@ from modules.validator import validate_config
 from modules.ai.openaiConnections import ai_create_openai_client, ai_extract_skills, ai_answer_question, ai_close_openai_client
 from modules.ai.deepseekConnections import deepseek_create_client, deepseek_extract_skills, deepseek_answer_question
 from modules.ai.geminiConnections import gemini_create_client, gemini_extract_skills, gemini_answer_question
+from modules.ai.proxyConnections import proxy_create_client, proxy_extract_skills, proxy_answer_question, proxy_choose_option
+from modules.knowledge_answers import knowledge_years
 
 from typing import Literal
 
@@ -669,11 +671,26 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                                 foundOption = True
                                 break
                     if not foundOption:
-                        #TODO: Use AI to answer the question need to be implemented logic to extract the options for the question
-                        print_lg(f'Failed to find an option with text "{answer}" for question labelled "{label_org}", answering randomly!')
-                        select.select_by_index(randint(1, len(select.options)-1))
-                        answer = select.first_selected_option.text
-                        randomly_answered_questions.add((f'{label_org} [ {options} ]',"select"))
+                        # 2026-10-17 (plan E): before a random option, the knowledge-grounded model picks the option that is true for him (the
+                        # most frequent case: "Please select your total years of professional experience:", 197 random picks in the log).
+                        # It returns None when the knowledge file does not settle the question; then the old random pick stands.
+                        ai_pick = None
+                        if use_AI and aiClient and ai_provider.lower() == "proxy" and label != "phone country code":
+                            try:
+                                ai_pick = proxy_choose_option(aiClient, label_org, optionsText, job_description=job_description)
+                                if ai_pick:
+                                    select.select_by_visible_text(ai_pick)
+                                    answer = ai_pick
+                                    print_lg(f'AI chose the option "{ai_pick}" for question labelled "{label_org}".')
+                            except Exception as e:
+                                print_lg("Failed to get an AI option!", e)
+                                ai_pick = None
+                        if not ai_pick:
+                            #TODO: Use AI to answer the question need to be implemented logic to extract the options for the question
+                            print_lg(f'Failed to find an option with text "{answer}" for question labelled "{label_org}", answering randomly!')
+                            select.select_by_index(randint(1, len(select.options)-1))
+                            answer = select.first_selected_option.text
+                            randomly_answered_questions.add((f'{label_org} [ {options} ]',"select"))
             questions_list.add((f'{label_org} [ {options} ]', answer, "select", prev_answer))
             continue
         
@@ -687,14 +704,17 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             label_org = label.text if label else "Unknown"
             answer = 'Yes'
             label = label_org.lower()
+            question_text = label_org           # the question alone, for the AI option pick below (label_org gets its options appended)
 
             label_org += ' [ '
             options = radio.find_elements(By.TAG_NAME, 'input')
             options_labels = []
-            
+            options_texts = []
+
             for option in options:
                 id = option.get_attribute("id")
                 option_label = try_xp(radio, f'.//label[@for="{id}"]', False)
+                options_texts.append(option_label.text if option_label else "Unknown")
                 options_labels.append( f'"{option_label.text if option_label else "Unknown"}"<{option.get_attribute("value")}>' ) # Saving option as "label <value>"
                 if option.is_selected(): prev_answer = options_labels[-1]
                 label_org += f' {options_labels[-1]},'
@@ -720,6 +740,19 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                                 answer = f'Decline ({option_label})' if len(possible_answer_phrases) > 1 else option_label
                                 break
                         if foundOption: break
+                    # 2026-10-17 (plan E): no option matched the default answer: the knowledge-grounded model picks the one that is true for him
+                    # (otherwise the first option, as before)
+                    if not foundOption and use_AI and aiClient and ai_provider.lower() == "proxy":
+                        try:
+                            ai_pick = proxy_choose_option(aiClient, question_text, options_texts, job_description=job_description)
+                            if ai_pick in options_texts:
+                                i = options_texts.index(ai_pick)
+                                foundOption = options[i]
+                                ele = foundOption
+                                answer = options_labels[i]
+                                print_lg(f'AI chose the option "{ai_pick}" for question labelled "{question_text}".')
+                        except Exception as e:
+                            print_lg("Failed to get an AI option!", e)
                     # if answer == 'Decline':
                     #     answer = options_labels[0]
                     #     for phrase in ["Prefer not", "not want", "not wish"]:
@@ -749,6 +782,10 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             if not prev_answer or overwrite_previous_answers:
                 if 'experience' in label or 'years' in label:
                     answer = experience_months if ('month' in label and 'year' not in label) else years_of_experience
+                    # 2026-10-17 (plan E): a tool named in the question gets ITS years from the private knowledge file (his Naukri profile first);
+                    # no tool named, or one with no number yet, keeps the answer above (a tool with no number, or one the file does not list at all,
+                    # is written to logs/knowledge_gaps.jsonl so the number can be added; python ai_answers_report.py lists them)
+                    answer = knowledge_years(label_org, answer)
                 elif 'phone' in label or 'mobile' in label: answer = phone_number
                 elif 'street' in label: answer = street
                 elif 'city' in label or 'location' in label or 'address' in label:
@@ -802,6 +839,8 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                                 answer = deepseek_answer_question(aiClient, label_org, options=None, question_type="text", job_description=job_description, about_company=None, user_information_all=user_information_all)
                             elif ai_provider.lower() == "gemini":
                                 answer = gemini_answer_question(aiClient, label_org, options=None, question_type="text", job_description=job_description, about_company=None, user_information_all=user_information_all)
+                            elif ai_provider.lower() == "proxy":
+                                answer = proxy_answer_question(aiClient, label_org, options=None, question_type="text", job_description=job_description, about_company=None, user_information_all=user_information_all)
                             else:
                                 randomly_answered_questions.add((label_org, "text"))
                                 answer = years_of_experience
@@ -848,6 +887,8 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                                 answer = deepseek_answer_question(aiClient, label_org, options=None, question_type="textarea", job_description=job_description, about_company=None, user_information_all=user_information_all)
                             elif ai_provider.lower() == "gemini":
                                 answer = gemini_answer_question(aiClient, label_org, options=None, question_type="textarea", job_description=job_description, about_company=None, user_information_all=user_information_all)
+                            elif ai_provider.lower() == "proxy":
+                                answer = proxy_answer_question(aiClient, label_org, options=None, question_type="textarea", job_description=job_description, about_company=None, user_information_all=user_information_all)
                             else:
                                 randomly_answered_questions.add((label_org, "textarea"))
                                 answer = ""
@@ -1159,6 +1200,8 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                 skills = deepseek_extract_skills(aiClient, description)
                             elif ai_provider.lower() == "gemini":
                                 skills = gemini_extract_skills(aiClient, description)
+                            elif ai_provider.lower() == "proxy":
+                                skills = proxy_extract_skills(aiClient, description)
                             else:
                                 skills = "In Development"
                             print_lg(f"Extracted skills using {ai_provider} AI")
@@ -1349,6 +1392,8 @@ def main() -> None:
                 aiClient = deepseek_create_client()
             elif ai_provider == "gemini":
                 aiClient = gemini_create_client()
+            elif ai_provider == "proxy":
+                aiClient = proxy_create_client()
             ##<
 
             try:
@@ -1419,6 +1464,8 @@ def main() -> None:
                     ai_close_openai_client(aiClient)
                 elif ai_provider.lower() == "gemini":
                     pass # Gemini client does not need to be closed
+                elif ai_provider.lower() == "proxy":
+                    pass # the proxy client is a plain dict
                 print_lg(f"Closed {ai_provider} AI client.")
             except Exception as e:
                 print_lg("Failed to close AI client:", e)

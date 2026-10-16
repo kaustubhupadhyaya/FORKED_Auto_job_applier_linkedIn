@@ -36,7 +36,7 @@ if not username or not password:
 
 ## Artificial Intelligence (Beta Not-Recommended)
 # Use AI
-use_AI = False                          # True or False, Note: True or False are case-sensitive
+use_AI = True                           # True or False, Note: True or False are case-sensitive. 2026-10-17: on, with ai_provider "proxy" below (plan E)
 '''
 Note: Set it as True only if you want to use AI, and If you either have a
 1. Local LLM model running on your local machine, with it's APIs exposed. Example softwares to achieve it are:
@@ -50,11 +50,13 @@ CHECK THE OPENAI API PIRCES AT THEIR WEBSITE (https://openai.com/api/pricing/).
 
 ##> ------ Yang Li : MARKYangL - Feature ------
 # Select AI Provider
-ai_provider = "deepseek"               # "openai", "deepseek"
+ai_provider = "proxy"                  # "openai", "deepseek", "gemini", "proxy"
 '''
 Note: Select your AI provider.
 * "openai" - OpenAI API (GPT models)
 * "deepseek" - DeepSeek API (DeepSeek models)
+* "proxy" - Gemini through the local Antigravity proxy on 127.0.0.1:8080 (modules/ai/proxyConnections.py), answering only from the private
+  knowledge file; needs no key and uses none of the llm_* settings below
 '''
 
 # DeepSeek-compatible endpoint (non-secret)
