@@ -7,6 +7,10 @@
   or LinkedIn showed a verification wall (exit 48, or a wall recorded in
   logs/wall-evidence during the attempt), or the sign-in failed (exit 45): each of
   the last two → NEEDS_HUMAN, no restart today.
+- A run that ends on a local-network error (net::ERR_NAME_NOT_RESOLVED & co: the home internet is down) is not a breakage:
+  the supervisor waits for LinkedIn to be reachable (linkedin_net.py, up to 8 h; logs/NETWORK_DOWN while it waits, one toast
+  after 30 min), then relaunches without using the restart budget or the zero-apply streak. Six such runs in a row that saved
+  nothing still stop it (NEEDS_HUMAN), as does an outage past 8 h.
 - Single-instance guarded via supervisor.lock.
 """
 import os
@@ -15,6 +19,8 @@ import sys
 import time
 import subprocess
 from datetime import datetime
+
+import linkedin_net
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 os.chdir(REPO)
@@ -39,6 +45,8 @@ RAM_WAIT_MAX_MIN = 20
 RAM_POLL_SEC = 30
 LAUNCH_RETRIES = 3
 LAUNCH_RETRY_WAIT_SEC = 300
+NET_MARKER = os.path.join(REPO, "logs", "NETWORK_DOWN")   # 2026-10-17: present only while the supervisor waits for the home internet
+JOB_TRACKER_DIR = r"C:\Users\Admin\GitHub\job-tracker"     # portal_kit.site_guard.notify_once: the toast registry shared with the keepalive
 TRACKER_PATH = r"C:\Users\Admin\GitHub\job-tracker\track_job_applications.py"
 _tracker_proc = None
 
@@ -66,6 +74,40 @@ def needs_human(reason):
             fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {reason}\n")
     except Exception:
         pass
+
+
+def net_toast(minutes):
+    """One toast per day for a long internet outage: the same registry and key scheme as the keepalive's toasts. Raises on failure
+    (linkedin_net logs it and carries on waiting)."""
+    if JOB_TRACKER_DIR not in sys.path:
+        sys.path.insert(0, JOB_TRACKER_DIR)
+    from portal_kit import site_guard
+    site_guard.notify_once("linkedin:NETWORK_DOWN", "LinkedIn bot waiting: no internet",
+                           f"LinkedIn has been unreachable for {minutes:.0f} min. The bot relaunches by itself when the connection is "
+                           "back. Details: logs\\supervisor.log in the LinkedIn bot folder.", by="linkedin_supervisor")
+
+
+def handle_outage(gained, what):
+    """A run ended because the home internet was down (what says how). True: LinkedIn is reachable again, relaunch; nothing was counted against
+    the restart budget or the zero-apply streak. False: NEEDS_HUMAN was written, stop. Progress still decides: NET_IDLE_RUN_LIMIT of these in
+    a row, none of them having saved an application, stop the supervisor, and so does an outage past linkedin_net.NET_WAIT_MAX_MIN."""
+    global net_idle_runs
+    net_idle_runs = 0 if (gained and gained > 0) else net_idle_runs + 1
+    if net_idle_runs >= linkedin_net.NET_IDLE_RUN_LIMIT:
+        needs_human(f"{net_idle_runs} runs in a row ended on a network error and saved nothing — NOT restarting; "
+                    "see logs/log.txt (net::ERR_...) and the internet connection.")
+        return False
+    slog(f"{what}.")
+    sweep_stale_browsers()      # no Chrome idling through the outage on a machine that is short of memory
+    down_min = linkedin_net.wait_until_reachable(slog, NET_MARKER, toast=net_toast)
+    if down_min is None:
+        needs_human(f"LinkedIn unreachable for {linkedin_net.NET_WAIT_MAX_MIN} min (home internet down?) — NOT restarting. "
+                    "Once the connection is back, delete logs/NEEDS_HUMAN.")
+        return False
+    slog(f"relaunching in 60 s (runs in a row that ended on a network error without a saved application: "
+         f"{net_idle_runs}/{linkedin_net.NET_IDLE_RUN_LIMIT}; restart budget unchanged at {restarts}/{MAX_RESTARTS}).")
+    time.sleep(60)
+    return True
 
 
 def _pid_alive(pid):
@@ -229,14 +271,23 @@ except Exception as e:
     print(f"lock failed ({e!r}); continuing anyway.", flush=True)
 
 slog("started.")
+try:
+    os.remove(NET_MARKER)   # a marker left by a supervisor that died while waiting
+except OSError:
+    pass
 restarts = 0
 zero_apply_streak = 0
 launch_fails = 0   # consecutive rc 43 (browser could not start); separate from the restart budget
+net_idle_runs = 0  # consecutive runs that ended on a network error and saved nothing
 
 while True:
     wait_for_ram()   # before `start` is taken, so the wait never counts as run time
     attempt = restarts + 1
     before = saved_count()
+    try:
+        log_offset = os.path.getsize(LOG)   # this attempt's part of the bot log starts here (linkedin_net.log_ended_on_network_error)
+    except OSError:
+        log_offset = 0
     start = time.time()
     out = os.path.join(REPO, "logs", f"supervised-attempt-{attempt}.log")
     err = os.path.join(REPO, "logs", f"supervised-attempt-{attempt}.err.log")
@@ -324,6 +375,12 @@ while True:
     if os.path.exists(today_marker) or rc == 44:
         slog("daily Easy Apply limit reached — goal achieved, stopping supervisor.")
         break
+    if rc == LAUNCH_FAILED_RC and not linkedin_net.reachable():
+        # 2026-10-17: the browser or its driver could not start while LinkedIn cannot be reached (the driver may need the network): the same
+        # outage, not a launch failure; it does not use the 3 launch retries.
+        if not handle_outage(gained, "browser/driver launch failed (rc 43) while LinkedIn is unreachable"):
+            break
+        continue
     if rc == LAUNCH_FAILED_RC:
         launch_fails += 1
         if launch_fails <= LAUNCH_RETRIES:
@@ -345,6 +402,17 @@ while True:
         break
     if gained and gained > 0:
         restarts = 0                # a run that saved applications is progress, not a crash loop: the restart budget starts over
+    # 2026-10-17: a run that ended because the home internet was down is not a breakage of the bot (it used to end the day through the
+    # zero-apply rule below). The signal is the run's own ending in the bot log: main() caught a WebDriverException whose text is a
+    # local-network error (linkedin_net.NET_ERR_RE). Wait for the connection, relaunch, spend no restart. Whatever else ended the run
+    # is handled exactly as before.
+    if linkedin_net.log_ended_on_network_error(LOG, log_offset):
+        if gained and gained > 0:
+            zero_apply_streak = 0           # a run that saved applications is progress, as in the rule below
+        if not handle_outage(gained, "run ended on a network error"):
+            break
+        continue
+    net_idle_runs = 0
     if restarts >= MAX_RESTARTS:
         needs_human("max restarts used — stopping (needs human review).")
         break
