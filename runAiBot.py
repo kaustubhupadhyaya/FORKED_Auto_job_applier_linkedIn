@@ -136,14 +136,8 @@ def _plain_number(x: float) -> str:
     """12.0 -> "12", 12.5 -> "12.5", 12.345 -> "12.35"."""
     return f"{x:.2f}".rstrip("0").rstrip(".")
 
-# 2026-10-17: lakhs are typed without ".0" ("12", not "12.0") and monthly pay in whole rupees ("83333", not "83333.33"): a "salary
-# (in lpa)" box can take whole numbers only ("Enter a whole number larger than 0", a saved real form of 2026-09-18).
-desired_salary_lakhs = _plain_number(desired_salary / 100000)
-desired_salary_monthly = str(round(desired_salary / 12))
+# Pay boxes are answered by _pay_answer() below, from these two numbers (rupees per year, config/questions.py).
 desired_salary = str(desired_salary)
-
-current_ctc_lakhs = _plain_number(current_ctc / 100000)
-current_ctc_monthly = str(round(current_ctc / 12))
 current_ctc = str(current_ctc)
 
 notice_period_months = str(-(-notice_period // 30))  # whole months, rounded UP: 15 days is "1" month (his official notice), never "0" (= immediate)
@@ -587,41 +581,51 @@ def answer_common_questions(label: str, answer: str) -> str:
     return answer
 
 
-def _whole_number_retry(question_el, prev_answer) -> str:
+def _whole_number_retry(question_el, prev_answer, nearest=False) -> str:
     """The whole number to type instead of a decimal that LinkedIn rejected in this question ("Enter a whole number larger than 0" under the
-    box), or "" when nothing needs retyping (no decimal there, or the box takes decimals: "Enter a decimal number ..."). Rounded down, so it
-    never claims more than the decimal did (3.3 -> 3, 2.7 -> 2), but at least 1, which is the smallest number such a box accepts. The test is
-    LinkedIn's English wording (this account's LinkedIn runs in English; the box itself carries no whole-or-decimal attribute). Never raises."""
+    box), or "" when nothing needs retyping (no decimal there, or the box takes decimals: "Enter a decimal number ..."). Years are rounded
+    down, so they never claim more than the decimal did (3.3 -> 3, 2.7 -> 2); pay (nearest=True) to the nearest whole number, as such a box
+    asks (1.25 lakhs a month -> 1). Always at least 1, the smallest number such a box accepts. The test is LinkedIn's English wording (this
+    account's LinkedIn runs in English; the box itself carries no whole-or-decimal attribute). Never raises."""
     try:
         v = (prev_answer or "").strip()
         if not re.fullmatch(r"\d+\.\d+", v):
             return ""
         msgs = question_el.find_elements(By.CSS_SELECTOR, ".artdeco-inline-feedback__message")
         if any("whole number" in (m.text or m.get_attribute("textContent") or "").lower() for m in msgs):
-            return str(max(1, int(float(v))))
+            return str(max(1, int(float(v) + 0.5) if nearest else int(float(v))))
     except Exception:
         pass
     return ""
 
 
 # 2026-10-17, from the bot's own log (logs/log.txt): "(in lpa)" and "(in lacs)" boxes got the full rupee amount, "cctc (in lpa)",
-# "currect compensation" and "What is your CTC?" got the expected pay instead of the current one, and "Based on your experience and the
-# responsibilities of this role, what base salary ...?" got the years rule's "3" (42 times).
-_PAY_WORDS = re.compile(r"salary|compensation|ctc|\blpa\b|lakh|\blacs?\b")
-_LAKHS = re.compile(r"lakh|\blacs?\b|\blpa\b|l\.p\.a")
-_FULL_RUPEE_EXAMPLE = re.compile(r"\d{5,}|\d{1,2},\d{2},\d{3}")  # "if your ctc is 7lpa, mention as 700000": the label asks for the full amount
+# "currect compensation" and "What is your CTC?" got the expected pay instead of the current one, lakhs were typed as "12.0", and "Based on
+# your experience and the responsibilities of this role, what base salary ...?" got the years rule's "3" (42 times).
+_PAY_WORDS = re.compile(r"salary|compensation|ctc|(?<![a-z])lpa\b|lakh|(?<![a-z])lacs?\b|\bpay\b|\bpackage\b|remuneration|stipend")
+_LAKHS = re.compile(r"lakh|(?<![a-z])lacs?\b|(?<![a-z])lpa\b|l\.p\.a")
+# "if your ctc is 7lpa, mention as 700000" or "in full values i.e. 100,000": the label's own example is a full amount, so it asks for one
+_FULL_RUPEE_EXAMPLE = re.compile(r"\d{5,}|\d{1,3}(?:,\d{2})*,\d{3}\b")
+_WHOLE_ASKED = re.compile(r"whole number|round(?:ed)? (?:off|up|down|to)|no decimals?|without decimals?|integer")
 _CURRENT_PAY = re.compile(r"current|currect|present|\bcctc\b|existing|most recent|last drawn")
 _EXPECTED_PAY = re.compile(r"expect|desired|looking for|\bectc\b|requirement|asking|want|seeking")
 
 
 def _pay_answer(label: str) -> str:
-    """His current or expected pay for a text box whose (lower-case) label asks about pay, in the unit the label asks for: per month, in
-    lakhs ("in lpa", "in lacs", "in lakhs per annum"; not when the label's own example is a full amount), else in rupees per year. A label
-    that names neither ("What is your CTC?") asks for the current pay."""
+    """His current or expected pay for a text box whose (lower-case) label asks about pay, in the unit the label asks for: per month or per
+    year, in lakhs ("in lpa", "in lacs", "12lacs", "in lakhs per annum"; not when the label's own example is a full amount) or in rupees. A
+    label that names neither ("What is your CTC?") asks for the current pay. Rupees are whole; lakhs keep up to two decimals ("12", "1.25"),
+    rounded to the nearest whole number when the label asks for one ("round to the nearest whole number")."""
     lakhs = bool(_LAKHS.search(label)) and not _FULL_RUPEE_EXAMPLE.search(label)
-    if _CURRENT_PAY.search(label) or not _EXPECTED_PAY.search(label):
-        return current_ctc_monthly if 'month' in label else current_ctc_lakhs if lakhs else current_ctc
-    return desired_salary_monthly if 'month' in label else desired_salary_lakhs if lakhs else desired_salary
+    current = bool(_CURRENT_PAY.search(label)) or not _EXPECTED_PAY.search(label)
+    amount = float(current_ctc if current else desired_salary)
+    if 'month' in label or ('stipend' in label and not re.search(r"annual|annum|year", label)):  # a stipend is paid by the month
+        amount /= 12
+    if lakhs:
+        amount /= 100000
+    if lakhs and not _WHOLE_ASKED.search(label):
+        return _plain_number(amount)
+    return str(int(amount + 0.5))
 
 
 def _offered_annual_pay(label: str) -> float | None:
@@ -830,11 +834,13 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             label = label_org.lower()
 
             prev_answer = text.get_attribute("value")
-            # 2026-10-17: years of experience are typed with their decimal (3.3, his total; a tool's own years from the knowledge file). A box
-            # that takes whole numbers only answers that with "Enter a whole number ..." after Next; on the next pass over the page it gets the
-            # whole number instead (3.3 -> 3). Only boxes the years rule below answers are retyped: a pay or score box keeps what it had, as before.
+            # 2026-10-17: years of experience are typed with their decimal (3.3, his total; a tool's own years from the knowledge file), and pay
+            # in lakhs may have one (1.25 lakhs a month). A box that takes whole numbers only answers that with "Enter a whole number ..." after
+            # Next; on the next pass over the page it gets the whole number instead (3.3 -> 3). Only boxes the years or the pay rule below
+            # answers are retyped: a score or percentage box keeps what it had, as before.
             years_question = ('experience' in label or 'years' in label) and not _PAY_WORDS.search(label)
-            whole = _whole_number_retry(Question, prev_answer) if years_question else ""
+            pay_question = not years_question and bool(_PAY_WORDS.search(label) or 'pay' in label)
+            whole = _whole_number_retry(Question, prev_answer, nearest=pay_question) if (years_question or pay_question) else ""
             if whole:
                 text.clear()
                 text.send_keys(whole)
