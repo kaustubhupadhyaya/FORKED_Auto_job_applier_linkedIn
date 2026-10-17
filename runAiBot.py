@@ -602,9 +602,12 @@ def _whole_number_retry(question_el, prev_answer, nearest=False) -> str:
 # 2026-10-17, from the bot's own log (logs/log.txt): "(in lpa)" and "(in lacs)" boxes got the full rupee amount, "cctc (in lpa)",
 # "currect compensation" and "What is your CTC?" got the expected pay instead of the current one, lakhs were typed as "12.0", and "Based on
 # your experience and the responsibilities of this role, what base salary ...?" got the years rule's "3" (42 times).
-# "pay" and "package" count only as pay words ("expected pay", "current package"), never in "pay-per-click" or "Python package development"
+# "pay" and "package" count only as pay words ("expected pay per month", "what package are you expecting"), never in "pay-per-click",
+# "pay as you go", "package manager" or "Python package development"
 _PAY_WORDS = re.compile(r"salary|compensation|ctc|(?<![a-z])lpa\b|l\.p\.a|lakh|(?<![a-z])lacs?\b|remuneration|stipend"
-                        r"|\bpay\b(?![\s-]*(?:per|as)\b)|(?:current|expected|annual|offered|salary|ctc|pay|fixed|joining)\s+package")
+                        r"|\bpay\b(?![\s-]*(?:per|as)[\s-]+(?:click|you)\b)"
+                        r"|(?:current|expected|annual|offered|salary|ctc|pay|fixed|joining|what|your)\s+package(?!\s*(?:manag|develop|design|build|deploy))"
+                        r"|\bpackage\s+(?:expect\w*|offer\w*|in\s+(?:inr|lpa))")
 _LAKHS = re.compile(r"lakh|(?<![a-z])lacs?\b|(?<![a-z])lpa\b|l\.p\.a")
 # "if your ctc is 7lpa, mention as 700000" or "in full values i.e. 100,000": the label's own example is a full amount, so it asks for one
 _FULL_RUPEE_EXAMPLE = re.compile(r"\d{5,}|\d{1,3}(?:,\d{2})*,\d{3}\b")
@@ -621,7 +624,7 @@ def _pay_answer(label: str) -> str:
     lakhs = bool(_LAKHS.search(label)) and not _FULL_RUPEE_EXAMPLE.search(label)
     current = bool(_CURRENT_PAY.search(label)) or not _EXPECTED_PAY.search(label)
     amount = float(current_ctc if current else desired_salary)
-    if 'month' in label or ('stipend' in label and not re.search(r"annual|annum|yearly|per year", label)):  # a stipend is paid by the month
+    if 'month' in label or ('stipend' in label and not re.search(r"annual|annum|yearly|per year|\bp\.a\b", label)):  # paid by the month
         amount /= 12
     if lakhs:
         amount /= 100000
