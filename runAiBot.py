@@ -602,12 +602,15 @@ def _whole_number_retry(question_el, prev_answer, nearest=False) -> str:
 # 2026-10-17, from the bot's own log (logs/log.txt): "(in lpa)" and "(in lacs)" boxes got the full rupee amount, "cctc (in lpa)",
 # "currect compensation" and "What is your CTC?" got the expected pay instead of the current one, lakhs were typed as "12.0", and "Based on
 # your experience and the responsibilities of this role, what base salary ...?" got the years rule's "3" (42 times).
-# "pay" and "package" count only as pay words ("expected pay per month", "what package are you expecting"), never in "pay-per-click",
-# "pay as you go", "package manager" or "Python package development"
-_PAY_WORDS = re.compile(r"salary|compensation|ctc|(?<![a-z])lpa\b|l\.p\.a|lakh|(?<![a-z])lacs?\b|remuneration|stipend"
-                        r"|\bpay\b(?![\s-]*(?:per|as)[\s-]+(?:click|you)\b)"
-                        r"|(?:current|expected|annual|offered|salary|ctc|pay|fixed|joining|what|your)\s+package(?!\s*(?:manag|develop|design|build|deploy))"
-                        r"|\bpackage\s+(?:expect\w*|offer\w*|in\s+(?:inr|lpa))")
+_PAY_CORE = r"salary|compensation|ctc|(?<![a-z])lpa\b|l\.p\.a|lakh|(?<![a-z])lacs?\b|remuneration|stipend"
+_NOT_PAY_PACKAGE = r"(?!\s*(?:manag|develop|design|build|deploy|version))"  # "package manager", "package development" ...
+# Chooses the pay rule: any "pay" or "package" too ("Total package (INR)", "Desired package").
+_PAY_WORDS = re.compile(_PAY_CORE + r"|\bpay\b|\bpackage\b" + _NOT_PAY_PACKAGE)
+# Keeps a pay question out of the years rule: "pay" and "package" only in a pay sense ("Based on your experience, what is your expected
+# pay per month?"), so "years of experience in pay-per-click" or "years with your package manager" stay years questions.
+_PAY_SENSE = re.compile(_PAY_CORE + r"|\bpay\b(?![\s-]*(?:per|as)[\s-]+(?:click|you)\b)"
+                        r"|(?:current|expected|annual|offered|salary|ctc|pay|fixed|joining|what|which|your|total|base|desired|gross|net|"
+                        r"monthly|yearly)\s+package" + _NOT_PAY_PACKAGE + r"|\bpackage\s*(?:\(|expect\w*|offer\w*|in\s+(?:inr|lpa))")
 _LAKHS = re.compile(r"lakh|(?<![a-z])lacs?\b|(?<![a-z])lpa\b|l\.p\.a")
 # "if your ctc is 7lpa, mention as 700000" or "in full values i.e. 100,000": the label's own example is a full amount, so it asks for one
 _FULL_RUPEE_EXAMPLE = re.compile(r"\d{5,}|\d{1,3}(?:,\d{2})*,\d{3}\b")
@@ -843,7 +846,7 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             # in lakhs may have one (1.25 lakhs a month). A box that takes whole numbers only answers that with "Enter a whole number ..." after
             # Next; on the next pass over the page it gets the whole number instead (3.3 -> 3). Only boxes the years or the pay rule below
             # answers are retyped: a score or percentage box keeps what it had, as before.
-            years_question = ('experience' in label or 'years' in label) and not _PAY_WORDS.search(label)
+            years_question = ('experience' in label or 'years' in label) and not _PAY_SENSE.search(label)
             pay_question = not years_question and bool(_PAY_WORDS.search(label) or 'pay' in label)
             whole = _whole_number_retry(Question, prev_answer, nearest=pay_question) if (years_question or pay_question) else ""
             if whole:
