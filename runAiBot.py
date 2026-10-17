@@ -132,17 +132,31 @@ def check_daily_limit_signal(driver_instance=None) -> tuple[bool, str]:
 
 re_experience = re.compile(r'[(]?\s*(\d+)\s*[)]?\s*[-to]*\s*\d*[+]*\s*year[s]?', re.IGNORECASE)
 
-desired_salary_lakhs = str(round(desired_salary / 100000, 2))
-desired_salary_monthly = str(round(desired_salary/12, 2))
+def _plain_number(x: float) -> str:
+    """12.0 -> "12", 12.5 -> "12.5", 12.345 -> "12.35"."""
+    return f"{x:.2f}".rstrip("0").rstrip(".")
+
+# 2026-10-17: lakhs are typed without ".0" ("12", not "12.0") and monthly pay in whole rupees ("83333", not "83333.33"): a "salary
+# (in lpa)" box can take whole numbers only ("Enter a whole number larger than 0", a saved real form of 2026-09-18).
+desired_salary_lakhs = _plain_number(desired_salary / 100000)
+desired_salary_monthly = str(round(desired_salary / 12))
 desired_salary = str(desired_salary)
 
-current_ctc_lakhs = str(round(current_ctc / 100000, 2))
-current_ctc_monthly = str(round(current_ctc/12, 2))
+current_ctc_lakhs = _plain_number(current_ctc / 100000)
+current_ctc_monthly = str(round(current_ctc / 12))
 current_ctc = str(current_ctc)
 
 notice_period_months = str(-(-notice_period // 30))  # whole months, rounded UP: 15 days is "1" month (his official notice), never "0" (= immediate)
 notice_period_weeks = str(notice_period//7)
 notice_period = str(notice_period)
+
+# 2026-10-17: his total experience is typed with its decimal ("3.3") into years-of-experience boxes only (years_of_experience_total in
+# config/questions.py; a config without it keeps years_of_experience). years_of_experience stays the whole number for everything else it
+# fills in (the last-resort answer to a text box no rule and no AI answered, the fresher test), so a percentage or pay box never gets "3.3".
+try:
+    years_of_experience_total = str(years_of_experience_total)  # noqa: F405
+except NameError:
+    years_of_experience_total = years_of_experience
 
 # "How many months of experience?" was answered with years_of_experience ("3" months, 2026-10-01).
 # Months come from the career start in config/questions.py (experience_start = "YYYY-MM").
@@ -151,7 +165,7 @@ try:
     _now = datetime.now()
     experience_months = str((_now.year - _start_y) * 12 + _now.month - _start_m)
 except Exception:
-    experience_months = str(int(float(years_of_experience or 0) * 12))
+    experience_months = str(int(float(years_of_experience_total or 0) * 12))
 
 aiClient = None
 ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
@@ -575,17 +589,39 @@ def answer_common_questions(label: str, answer: str) -> str:
 
 def _whole_number_retry(question_el, prev_answer) -> str:
     """The whole number to type instead of a decimal that LinkedIn rejected in this question ("Enter a whole number larger than 0" under the
-    box), or "" when nothing needs retyping (no decimal there, or the box takes decimals: "Enter a decimal number ..."). Never raises."""
+    box), or "" when nothing needs retyping (no decimal there, or the box takes decimals: "Enter a decimal number ..."). Rounded down, so it
+    never claims more than the decimal did (3.3 -> 3, 2.7 -> 2), but at least 1, which is the smallest number such a box accepts. The test is
+    LinkedIn's English wording (this account's LinkedIn runs in English; the box itself carries no whole-or-decimal attribute). Never raises."""
     try:
         v = (prev_answer or "").strip()
         if not re.fullmatch(r"\d+\.\d+", v):
             return ""
         msgs = question_el.find_elements(By.CSS_SELECTOR, ".artdeco-inline-feedback__message")
         if any("whole number" in (m.text or m.get_attribute("textContent") or "").lower() for m in msgs):
-            return str(int(float(v) + 0.5))
+            return str(max(1, int(float(v))))
     except Exception:
         pass
     return ""
+
+
+# 2026-10-17, from the bot's own log (logs/log.txt): "(in lpa)" and "(in lacs)" boxes got the full rupee amount, "cctc (in lpa)",
+# "currect compensation" and "What is your CTC?" got the expected pay instead of the current one, and "Based on your experience and the
+# responsibilities of this role, what base salary ...?" got the years rule's "3" (42 times).
+_PAY_WORDS = re.compile(r"salary|compensation|ctc|\blpa\b|lakh|\blacs?\b")
+_LAKHS = re.compile(r"lakh|\blacs?\b|\blpa\b|l\.p\.a")
+_FULL_RUPEE_EXAMPLE = re.compile(r"\d{5,}|\d{1,2},\d{2},\d{3}")  # "if your ctc is 7lpa, mention as 700000": the label asks for the full amount
+_CURRENT_PAY = re.compile(r"current|currect|present|\bcctc\b|existing|most recent|last drawn")
+_EXPECTED_PAY = re.compile(r"expect|desired|looking for|\bectc\b|requirement|asking|want|seeking")
+
+
+def _pay_answer(label: str) -> str:
+    """His current or expected pay for a text box whose (lower-case) label asks about pay, in the unit the label asks for: per month, in
+    lakhs ("in lpa", "in lacs", "in lakhs per annum"; not when the label's own example is a full amount), else in rupees per year. A label
+    that names neither ("What is your CTC?") asks for the current pay."""
+    lakhs = bool(_LAKHS.search(label)) and not _FULL_RUPEE_EXAMPLE.search(label)
+    if _CURRENT_PAY.search(label) or not _EXPECTED_PAY.search(label):
+        return current_ctc_monthly if 'month' in label else current_ctc_lakhs if lakhs else current_ctc
+    return desired_salary_monthly if 'month' in label else desired_salary_lakhs if lakhs else desired_salary
 
 
 def _offered_annual_pay(label: str) -> float | None:
@@ -794,18 +830,22 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             label = label_org.lower()
 
             prev_answer = text.get_attribute("value")
-            # 2026-10-17: years are typed with their decimal (3.3, his total; 2.2 ...). A box that takes whole numbers only answers that with
-            # "Enter a whole number ..." after Next; on the next pass over the page it gets the whole number instead (3.3 -> 3).
-            whole = _whole_number_retry(Question, prev_answer)
+            # 2026-10-17: years of experience are typed with their decimal (3.3, his total; a tool's own years from the knowledge file). A box
+            # that takes whole numbers only answers that with "Enter a whole number ..." after Next; on the next pass over the page it gets the
+            # whole number instead (3.3 -> 3). Only boxes the years rule below answers are retyped: a pay or score box keeps what it had, as before.
+            years_question = ('experience' in label or 'years' in label) and not _PAY_WORDS.search(label)
+            whole = _whole_number_retry(Question, prev_answer) if years_question else ""
             if whole:
                 text.clear()
                 text.send_keys(whole)
                 print_lg(f'"{label_org}" takes whole numbers only: typed {whole} instead of {prev_answer}.')
+                for row in [r for r in questions_list if r[0] == label and r[1] == prev_answer]:
+                    questions_list.discard(row)  # the row of the pass that typed the decimal: the list keeps the answer that was sent
                 questions_list.add((label, whole, "text", prev_answer))
                 continue
             if not prev_answer or overwrite_previous_answers:
-                if 'experience' in label or 'years' in label:
-                    answer = experience_months if ('month' in label and 'year' not in label) else years_of_experience
+                if years_question:
+                    answer = experience_months if ('month' in label and 'year' not in label) else years_of_experience_total
                     # 2026-10-17 (plan E): a tool named in the question gets ITS years from the private knowledge file (his Naukri profile first);
                     # no tool named, or one with no number yet, keeps the answer above (a tool with no number, or one the file does not list at all,
                     # is written to logs/knowledge_gaps.jsonl so the number can be added; python ai_answers_report.py lists them)
@@ -829,21 +869,8 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                     elif 'week' in label:
                         answer = notice_period_weeks
                     else: answer = notice_period
-                elif 'salary' in label or 'compensation' in label or 'ctc' in label or 'pay' in label: 
-                    if 'current' in label or 'present' in label:
-                        if 'month' in label:
-                            answer = current_ctc_monthly
-                        elif 'lakh' in label:
-                            answer = current_ctc_lakhs
-                        else:
-                            answer = current_ctc
-                    else:
-                        if 'month' in label:
-                            answer = desired_salary_monthly
-                        elif 'lakh' in label:
-                            answer = desired_salary_lakhs
-                        else:
-                            answer = desired_salary
+                elif _PAY_WORDS.search(label) or 'pay' in label:
+                    answer = _pay_answer(label)
                 elif 'linkedin' in label: answer = linkedIn
                 elif 'website' in label or 'blog' in label or 'portfolio' in label or 'link' in label: answer = website
                 elif 'scale of 1-10' in label: answer = confidence_level
