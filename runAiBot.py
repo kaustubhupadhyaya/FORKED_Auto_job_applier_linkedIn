@@ -140,7 +140,7 @@ current_ctc_lakhs = str(round(current_ctc / 100000, 2))
 current_ctc_monthly = str(round(current_ctc/12, 2))
 current_ctc = str(current_ctc)
 
-notice_period_months = str(notice_period//30)
+notice_period_months = str(-(-notice_period // 30))  # whole months, rounded UP: 15 days is "1" month (his official notice), never "0" (= immediate)
 notice_period_weeks = str(notice_period//7)
 notice_period = str(notice_period)
 
@@ -151,7 +151,7 @@ try:
     _now = datetime.now()
     experience_months = str((_now.year - _start_y) * 12 + _now.month - _start_m)
 except Exception:
-    experience_months = str(int(years_of_experience or 0) * 12)
+    experience_months = str(int(float(years_of_experience or 0) * 12))
 
 aiClient = None
 ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
@@ -559,7 +559,7 @@ def answer_common_questions(label: str, answer: str) -> str:
     # Unknown yes/no questions default to "Yes", which answered "Are you a fresher or do you have no more than
     # 1 year of experience?" with Yes (seen 2026-10-01). Experience is years_of_experience, never fresher.
     elif 'fresher' in label or re.search(r'(no more than|less than|under|at most)\s+(1|one)\s+year', label):
-        answer = 'Yes' if int(years_of_experience or 0) < 1 else 'No'
+        answer = 'Yes' if float(years_of_experience or 0) < 1 else 'No'
     # "Are you serving your notice period?" also fell to the Yes default; the user is not (2026-09-24).
     elif 'serving' in label and 'notice' in label:
         answer = 'No'
@@ -571,6 +571,21 @@ def answer_common_questions(label: str, answer: str) -> str:
         if offered is not None:
             answer = 'Yes' if offered >= int(current_ctc) else 'No'
     return answer
+
+
+def _whole_number_retry(question_el, prev_answer) -> str:
+    """The whole number to type instead of a decimal that LinkedIn rejected in this question ("Enter a whole number larger than 0" under the
+    box), or "" when nothing needs retyping (no decimal there, or the box takes decimals: "Enter a decimal number ..."). Never raises."""
+    try:
+        v = (prev_answer or "").strip()
+        if not re.fullmatch(r"\d+\.\d+", v):
+            return ""
+        msgs = question_el.find_elements(By.CSS_SELECTOR, ".artdeco-inline-feedback__message")
+        if any("whole number" in (m.text or m.get_attribute("textContent") or "").lower() for m in msgs):
+            return str(int(float(v) + 0.5))
+    except Exception:
+        pass
+    return ""
 
 
 def _offered_annual_pay(label: str) -> float | None:
@@ -779,6 +794,15 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             label = label_org.lower()
 
             prev_answer = text.get_attribute("value")
+            # 2026-10-17: years are typed with their decimal (3.3, his total; 2.2 ...). A box that takes whole numbers only answers that with
+            # "Enter a whole number ..." after Next; on the next pass over the page it gets the whole number instead (3.3 -> 3).
+            whole = _whole_number_retry(Question, prev_answer)
+            if whole:
+                text.clear()
+                text.send_keys(whole)
+                print_lg(f'"{label_org}" takes whole numbers only: typed {whole} instead of {prev_answer}.')
+                questions_list.add((label, whole, "text", prev_answer))
+                continue
             if not prev_answer or overwrite_previous_answers:
                 if 'experience' in label or 'years' in label:
                     answer = experience_months if ('month' in label and 'year' not in label) else years_of_experience
