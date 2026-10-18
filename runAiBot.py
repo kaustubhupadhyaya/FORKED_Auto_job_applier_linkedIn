@@ -474,6 +474,17 @@ def read_applicant_status(job_id: str, wait_s: float = 7.0) -> tuple[bool | None
         _time.sleep(0.4)
 
 
+def log_filter_pass(job_id: str, title: str, company: str, location: str, seen: str) -> None:
+    """One line per job that passed the filter (2026-10-18, user decision): the status LinkedIn showed at the moment of the check. Before this
+    only skips were logged, so an application's status at check time had to be read off the page the bot saves a few seconds after Submit."""
+    try:
+        with open(os.path.join(logs_folder_path, "linkedin_filter_passes.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "job_id": job_id, "title": title,
+                                  "company": company, "location": location, "seen": seen}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def log_filter_skip(job_id: str, title: str, company: str, location: str, reason: str, seen: str) -> None:
     """One line per job the mandatory filter skipped, for the dashboard and for telling a real rejection from a broken selector."""
     try:
@@ -1206,6 +1217,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                             if is_active is False: rejected_jobs.add(job_id)    # "unreadable" is a lag or a layout problem, not a verdict on the job
                             skip_count += 1
                             continue
+                        log_filter_pass(job_id, title, company, work_location, status_seen)    # 2026-10-18: the status at the moment of the check
 
                     # Hiring Manager info
                     try:

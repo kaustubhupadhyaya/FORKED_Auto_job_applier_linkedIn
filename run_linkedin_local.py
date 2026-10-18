@@ -127,6 +127,74 @@ except Exception as _e:
     except Exception:
         pass
 
+# --- Title-gate rules (user decision 2026-10-18), loaded BEFORE the bot launches Chrome ---------------------------------------------
+# The India pass skips job cards whose TITLE the user's shared fit rules rule out (job-tracker/portal_kit/fit.py + ~/.secrets/fit_rules.json,
+# the one definition every applier shares; 64% of the 158 applications of 10-13..10-18 failed them on the title alone: off-role titles such as
+# intern and trainee, titles outside his roles, titles built on a stack he does not use). The gate is mandatory. If the live rules cannot be
+# loaded, the last copy that did load (logs/fit_gate_lastgood/) is used and logs/FIT_RULES_STALE says so; if that fails too the run stops with
+# exit 49 and logs/FIT_RULES_UNAVAILABLE, instead of applying without the gate.
+_FIT_SRC = r"C:\Users\Admin\GitHub\job-tracker\portal_kit\fit.py"
+_FIT_RULES_SRC = os.path.join(os.path.expanduser("~"), ".secrets", "fit_rules.json")
+_FIT_LASTGOOD = os.path.join(REPO, "logs", "fit_gate_lastgood")
+_FIT_EXIT = 49
+_FIT = {"mod": None, "rules": None, "stale": False}
+
+
+def _fit_load(py_path, rules_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("jt_fit_gate", py_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    rules = mod.load_rules(rules_path)
+    mod.title_reasons("Data Engineer", "linkedin", rules)   # one real call: a module or rules this gate cannot use stop the run here, not at the first card
+    return mod, rules
+
+
+def _fit_marker(name, text=None):
+    p = os.path.join(REPO, "logs", name)
+    try:
+        if text is None:
+            if os.path.exists(p):
+                os.remove(p)
+        else:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}\n")
+    except Exception:
+        pass
+
+
+def _fit_gate_startup():
+    import shutil
+    try:
+        mod, rules = _fit_load(_FIT_SRC, _FIT_RULES_SRC)
+    except Exception as e:
+        live_err = f"{type(e).__name__}: {str(e)[:160]}"
+        try:
+            mod, rules = _fit_load(os.path.join(_FIT_LASTGOOD, "fit.py"), os.path.join(_FIT_LASTGOOD, "fit_rules.json"))
+        except Exception as e2:
+            _fit_marker("FIT_RULES_UNAVAILABLE", f"live: {live_err}; last good copy: {type(e2).__name__}: {str(e2)[:120]}")
+            _note(f"FIT RULES UNAVAILABLE (live: {live_err}; last good copy: {type(e2).__name__}: {str(e2)[:120]}). "
+                  f"The bot does not apply without its title gate: exit {_FIT_EXIT}.")
+            sys.exit(_FIT_EXIT)
+        _FIT["stale"] = True
+        _fit_marker("FIT_RULES_STALE", f"the live fit rules could not be loaded ({live_err}); the last copy that loaded (rules {rules.version}) is in use")
+        _note(f"FIT RULES: the live copy could not be loaded ({live_err}); using the last copy that loaded (rules {rules.version}). Fix the live copy.")
+    else:
+        try:
+            os.makedirs(_FIT_LASTGOOD, exist_ok=True)
+            shutil.copy2(_FIT_SRC, os.path.join(_FIT_LASTGOOD, "fit.py"))
+            shutil.copy2(_FIT_RULES_SRC, os.path.join(_FIT_LASTGOOD, "fit_rules.json"))
+        except Exception as ce:
+            _note(f"fit gate: could not keep a last-good copy ({type(ce).__name__})")
+        _fit_marker("FIT_RULES_STALE")
+        _fit_marker("FIT_RULES_UNAVAILABLE")
+    _FIT["mod"], _FIT["rules"] = mod, rules
+    _note(f"title gate loaded: fit rules {rules.version}{' (STALE last-good copy)' if _FIT['stale'] else ''}; India pass only")
+
+
+_fit_gate_startup()
+
 # --- Import the bot (launches Chrome on import via modules.open_chrome) --------
 # 2026-09-30: open_chrome.py calls exit() (code 0) when Chrome/driver cannot start, which made a
 # dead launch look like a clean run. Turn that into exit 43 so the supervisor stops and flags it.
@@ -967,7 +1035,89 @@ def _reconcile_ln_periodic(force=False):
 _orig_get_job_main_details = R.get_job_main_details
 
 
-def _watched_get_job_main_details(job, blacklisted_companies, rejected_jobs):
+_TITLE_SKIPS_LOG = os.path.join(REPO, "logs", "linkedin_title_skips.jsonl")
+_GATE_ERRORS = {"n": 0}
+
+
+def _title_gate_error(where, e):
+    """The gate never stops a run on a card it cannot read, but a gate that fails on EVERY card would silently do nothing: the first few
+    errors of a run go to the hardening log."""
+    _GATE_ERRORS["n"] += 1
+    if _GATE_ERRORS["n"] <= 5:
+        _note(f"title gate error in {where} ({_GATE_ERRORS['n']}): {type(e).__name__}: {str(e)[:160]}")
+
+
+def _title_gate_on():
+    """India pass only: the UAE pass (R.SEARCH_URL_EXTRA set by the overlay) has its own title gate (U3)."""
+    return _FIT["rules"] is not None and not getattr(R, "SEARCH_URL_EXTRA", "")
+
+
+def _title_gate_reasons(title):
+    if not title or title == "Unknown" or not _title_gate_on():
+        return []
+    return _FIT["mod"].title_reasons(title, "linkedin", _FIT["rules"])
+
+
+def _title_gate_log(job_id, title, company, reasons, stage):
+    try:
+        import json as _json
+        with open(_TITLE_SKIPS_LOG, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "job_id": job_id, "title": title, "company": company,
+                                  "reasons": reasons, "stage": stage, "rules": _FIT["rules"].version}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _title_gate_card(job, rejected_jobs):
+    """Judge a job card by the title it shows, BEFORE any click or pacing wait (a skipped card costs about a second instead of 8-20 s plus
+    a click). Returns get_job_main_details' tuple with skip=True when the title is ruled out, else None. Never raises: a card that cannot
+    be read goes on to the normal path, where the parsed title is judged again (_title_gate_parsed)."""
+    try:
+        if not _title_gate_on():
+            return None
+        a = job.find_element(By.TAG_NAME, "a")
+        title = (a.text or "").split("\n")[0].strip()
+        if not title:                                   # the list renders only cards near the viewport: bring this one into view once
+            R.scroll_to_view(R.driver, a, True)
+            time.sleep(0.4)
+            title = (a.text or "").split("\n")[0].strip()
+        reasons = _title_gate_reasons(title)
+        if not reasons:
+            return None
+        job_id = job.get_dom_attribute("data-occludable-job-id") or "unknown"
+        try:
+            company = job.find_element(By.CLASS_NAME, "artdeco-entity-lockup__subtitle").text.split("\n")[0].split(" · ")[0].strip()
+        except Exception:
+            company = ""
+        rejected_jobs.add(job_id)
+        R.print_lg(f'Title gate: skipping "{title}" ({"; ".join(reasons)}). Job ID: {job_id}!')
+        _title_gate_log(job_id, title, company, reasons, "card")
+        return (job_id, title, company or "Unknown", "", "", True)
+    except Exception as e:
+        if type(e).__name__ not in ("NoSuchElementException", "StaleElementReferenceException"):    # an unreadable or stale card is normal
+            _title_gate_error("card", e)
+        return None
+
+
+def _title_gate_parsed(res, rejected_jobs):
+    """The same judgement on the title the bot parsed after its own click (a card the early read could not use). Never raises."""
+    try:
+        job_id, title, company, location, style, skip = res
+        if skip:
+            return res
+        reasons = _title_gate_reasons(title)
+        if not reasons:
+            return res
+        rejected_jobs.add(job_id)
+        R.print_lg(f'Title gate: skipping "{title} | {company}" ({"; ".join(reasons)}). Job ID: {job_id}!')
+        _title_gate_log(job_id, title, company, reasons, "parsed")
+        return (job_id, title, company, location, style, True)
+    except Exception as e:
+        _title_gate_error("parsed", e)
+        return res
+
+
+def _watched_get_job_main_details_inner(job, blacklisted_companies, rejected_jobs):
     try:
         # L2: a verification wall mid-run ends the run (exit 48; SystemExit passes the except below). It used to get a
         # 10-minute pause, after which the run carried on.
@@ -1023,6 +1173,13 @@ def _watched_get_job_main_details(job, blacklisted_companies, rejected_jobs):
             return _orig_get_job_main_details(job, blacklisted_companies, rejected_jobs)
         except Exception:
             return ("unknown", "Unknown", "Unknown", "", "", True)
+
+
+def _watched_get_job_main_details(job, blacklisted_companies, rejected_jobs):
+    pre = _title_gate_card(job, rejected_jobs)          # 2026-10-18: title gate first, before the pacing wait and the click
+    if pre is not None:
+        return pre
+    return _title_gate_parsed(_watched_get_job_main_details_inner(job, blacklisted_companies, rejected_jobs), rejected_jobs)
 
 
 R.get_job_main_details = _watched_get_job_main_details

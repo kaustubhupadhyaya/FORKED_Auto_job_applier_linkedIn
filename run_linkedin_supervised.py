@@ -35,6 +35,7 @@ GATE_MARKER = os.path.join(REPO, "logs", "GATE_STOPPED")
 NEEDS_HUMAN = os.path.join(REPO, "logs", "NEEDS_HUMAN")
 LAUNCH_FAILED_RC = 43   # run_linkedin_local.py: Chrome/driver could not start
 WALL_RC = 48            # run_linkedin_local.py: LinkedIn verification wall (L2, 2026-10-13); it wrote logs/LINKEDIN_WALL_<date>
+FIT_RULES_RC = 49       # run_linkedin_local.py: the title gate's fit rules could not be loaded (2026-10-18); it wrote logs/FIT_RULES_UNAVAILABLE
 WALL_EVIDENCE_DIR = os.path.join(REPO, "logs", "wall-evidence")   # run_linkedin_local.py: wall-<time>-<where>.json per wall
 SIGNIN_RC = 45          # run_linkedin_local.py: signed out, and its one vault sign-in failed or was already used (2026-10-14)
 # 2026-10-02: at ~260 MB of free RAM Chrome could not start (rc 43) and that single failure parked
@@ -370,6 +371,12 @@ while True:
     if rc == SIGNIN_RC:
         # 2026-10-14: signed out and the run's one vault sign-in failed or was used up. Not a wall: no marker, no hold.
         needs_human("LinkedIn sign-in failed: YOUR TURN, sign in in the linkedin-1 profile")
+        break
+    if rc == FIT_RULES_RC:
+        # 2026-10-18: the title gate's rules could not be loaded, live or from the last good copy. The bot never applies without the gate, so a
+        # restart would only fail the same way; the two zero-apply short runs it takes to stop are skipped.
+        needs_human("title-gate rules unavailable (rc 49): fix ~/.secrets/fit_rules.json or job-tracker portal_kit/fit.py "
+                    "(see logs/FIT_RULES_UNAVAILABLE). NOT restarting.")
         break
     today_marker = os.path.join(REPO, "logs", f"LINKEDIN_DAILY_LIMIT_{datetime.now():%Y-%m-%d}")
     if os.path.exists(today_marker) or rc == 44:
