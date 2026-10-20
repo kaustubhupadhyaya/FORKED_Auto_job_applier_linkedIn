@@ -142,7 +142,7 @@
                         
                         if (response.ok) {
                             appliedCell.innerHTML = '<span class="tick">✓</span>';
-                            job.Date_Applied = new Date().toISOString();
+                            job.Date_Applied = new Date(Date.now() + 19800000).toISOString().replace(/\.\d+Z$/, "+05:30");   // IST only
                         }
                     } catch (error) {
                         console.error('Error updating applied date:', error);

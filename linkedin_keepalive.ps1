@@ -71,18 +71,21 @@ $SupervisorLogPath = Join-Path $LogsDir "supervisor.log"
 $GateMarkerPath    = Join-Path $LogsDir "GATE_STOPPED"
 $SupervisorLock    = Join-Path $LogsDir "supervisor.lock"
 $HistoryCsvPath    = Join-Path $RepoDir "all excels\all_applied_applications_history.csv"
-$ResetMarginMin    = 5     # start this many minutes after LinkedIn's daily reset (00:00 UTC = 05:30 IST)
+$ResetMarginMin    = 5     # start this many minutes after LinkedIn's daily reset (05:30 IST)
 $WallHoldPath      = Join-Path $LogsDir "LINKEDIN_WALL_HOLD"
 # Per-day toast registry, meant to be shared with the Gulf tools (none writes it yet). Its format is defined at
 # Read-ToastRegistry below.
 $ToastRegistryPath = "C:\Users\Admin\GitHub\job-tracker\state\gulf_toasts.json"
 $script:ToastsShown = @{}  # this process's own record too, so an unreadable registry never repeats a toast every pass
 
-# LinkedIn's Easy Apply quota resets at 00:00 UTC, not at local midnight: measured 2026-10-01..10-08, every
+# LinkedIn's Easy Apply quota resets at 05:30 IST, not at midnight: measured 2026-10-01..10-08, every
 # launch between 00:00 and 05:30 IST was refused and every first success of a day came after 05:30 IST.
+# (Local time is IST on this PC; the house rule is IST only, so nothing here converts to or from UTC.)
 function Get-NextLinkedInReset {
-    $utcNow = (Get-Date).ToUniversalTime()
-    return $utcNow.Date.AddDays(1).ToLocalTime().AddMinutes($ResetMarginMin)
+    $now = Get-Date
+    $reset = $now.Date.AddHours(5).AddMinutes(30)
+    if ($reset -le $now) { $reset = $reset.AddDays(1) }
+    return $reset.AddMinutes($ResetMarginMin)
 }
 
 # ---------------------------------------------------------------- Logging
@@ -560,7 +563,7 @@ function Invoke-KeepalivePass {
     }
 
     # 5. Process is DEAD - LinkedIn's daily limit
-    # 2026-10-08: the limit is LinkedIn's own, counted per UTC day (resets 05:30 IST). Resting until local
+    # 2026-10-08: the limit is LinkedIn's own, counted from 05:30 IST to 05:30 IST. Resting until local
     # midnight and then retrying every 2 h (the 10-01 design, made before the reset time was known) wasted
     # 3 refused launches a night, ran the UAE pass only when the quota was already gone, and made the
     # dashboard show "Failing". Now a limit, with or without saves today, rests until the next reset.
@@ -569,7 +572,7 @@ function Invoke-KeepalivePass {
     if ($limitReached -and -not $restUntil) {
         $restUntil = Get-NextLinkedInReset
         $state | Add-Member -NotePropertyName "LimitRestUntil" -NotePropertyValue $restUntil.ToString("s") -Force
-        Write-KeepaliveLog "LinkedIn's Easy Apply limit is reached ($todayCount saved today). LinkedIn resets it at 00:00 UTC; resting until $($restUntil.ToString('yyyy-MM-dd HH:mm'))." "OK"
+        Write-KeepaliveLog "LinkedIn's Easy Apply limit is reached ($todayCount saved today). LinkedIn resets it at 05:30 IST; resting until $($restUntil.ToString('yyyy-MM-dd HH:mm'))." "OK"
     }
     if ($restUntil) {
         $state.LastLimitDate = $todayStr
