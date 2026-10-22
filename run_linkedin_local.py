@@ -1175,7 +1175,38 @@ def _watched_get_job_main_details_inner(job, blacklisted_companies, rejected_job
             return ("unknown", "Unknown", "Unknown", "", "", True)
 
 
+_RENDER_MISS = {"n": 0}
+
+
+def _render_job_card(job) -> None:
+    """2026-10-21: LinkedIn draws a result card only while it is near the viewport; the others are empty placeholders with no link in them. Before this,
+    such a card cost the pacing wait (8-20 s), a failed click, a discard and a second failed click: about 25 s, 2,085 of them in the three counts from
+    19 Oct (47% of the 20 Oct count), 28% of all cards in one run; the UAE pass, which draws each card first, saw 0.5%. So every card is scrolled to, and
+    given up to ~2 s to show its link, before anything is decided from it (linkedin_uae_overlay._render_card does the same). A card that is already
+    drawn costs one script call and one lookup. A card that still shows no link after 2 s goes on to the old path, and the first five such misses of a
+    run (then every 50th) are noted in the hardening log. Never raises."""
+    try:
+        R.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", job)
+    except Exception:
+        return
+    # 2026-10-22: the first version waited for the link only. Live check of the 22 Oct window: 185 "Job-card click failed" (all NoSuchElementException) with
+    # almost no render notes, so the link was there and the card's subtitle (company) was not drawn yet; get_job_main_details needs both. Wait for both.
+    have = (False, False)
+    for _ in range(10):
+        try:
+            have = (bool(job.find_elements(By.TAG_NAME, "a")), bool(job.find_elements(By.CLASS_NAME, "artdeco-entity-lockup__subtitle")))
+        except Exception:
+            return
+        if all(have):
+            return
+        time.sleep(0.2)
+    _RENDER_MISS["n"] += 1
+    if _RENDER_MISS["n"] <= 5 or _RENDER_MISS["n"] % 50 == 0:
+        _note(f"render: card still has no {'link' if not have[0] else 'subtitle'} after 2 s (miss {_RENDER_MISS['n']} this run)")
+
+
 def _watched_get_job_main_details(job, blacklisted_companies, rejected_jobs):
+    _render_job_card(job)                               # 2026-10-21: draw the card first, so an undrawn one is read instead of failing after the pacing wait
     pre = _title_gate_card(job, rejected_jobs)          # 2026-10-18: title gate first, before the pacing wait and the click
     if pre is not None:
         return pre
